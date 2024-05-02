@@ -2,9 +2,10 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::cmp::{self};
+use std::collections::binary_heap::PeekMut;
 use std::collections::BinaryHeap;
 
-use anyhow::Result;
+use anyhow::{bail, Ok, Result};
 
 use crate::key::KeySlice;
 
@@ -47,7 +48,30 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut bheap = BinaryHeap::from_iter(
+            iters
+                .into_iter()
+                .enumerate()
+                .map(|(i, iter)| HeapWrapper(i, iter)),
+        );
+
+        // // remove all invalid iterators...
+        bheap.retain(|x| x.1.is_valid());
+        if bheap.is_empty() {
+            return MergeIterator {
+                iters: bheap,
+                current: None,
+            };
+        }
+
+        if let Some(inner_iter) = bheap.pop() {
+            return MergeIterator {
+                iters: bheap,
+                current: Some(inner_iter),
+            };
+        }
+
+        unreachable!("Failed to create MergeIterator... this should never happen")
     }
 }
 
@@ -57,18 +81,66 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        if let Some(current) = &self.current {
+            current.1.key()
+        } else {
+            KeySlice::default()
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if let Some(current) = &self.current {
+            current.1.value()
+        } else {
+            &[]
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        if let Some(current) = &self.current {
+            current.1.is_valid()
+        } else {
+            false
+        }
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if !self.is_valid() {
+            bail!("Invalid iterator")
+        }
+
+        // we want to advance all iterators that have the same key as the current iterator since we only want to return one item per key across all iterators
+        // and we want to keep the invariant that the current iterator has the latest value for a given key
+
+        while let Some(mut inner_iter) = self.iters.peek_mut() {
+            if inner_iter.1.key() == self.current.as_ref().unwrap().1.key() {
+                if let Err(e) = inner_iter.1.next() {
+                    PeekMut::pop(inner_iter);
+                    return Err(e);
+                }
+
+                if !inner_iter.1.is_valid() {
+                    PeekMut::pop(inner_iter);
+                }
+            } else {
+                break;
+            }
+        }
+
+        if let Some(current) = &mut self.current {
+            current.1.next()?;
+        }
+
+        if self.current.as_ref().unwrap().1.is_valid() {
+            self.iters.push(self.current.take().unwrap());
+        }
+
+        if let Some(inner_iter) = self.iters.pop() {
+            self.current = Some(inner_iter);
+        } else {
+            self.current = None;
+        }
+
+        Ok(())
     }
 }
