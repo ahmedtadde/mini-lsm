@@ -5,7 +5,7 @@ use std::cmp::{self};
 use std::collections::binary_heap::PeekMut;
 use std::collections::BinaryHeap;
 
-use anyhow::{bail, Ok, Result};
+use anyhow::{Ok, Result};
 
 use crate::key::KeySlice;
 
@@ -48,15 +48,15 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        let mut bheap = BinaryHeap::from_iter(
-            iters
-                .into_iter()
-                .enumerate()
-                .map(|(i, iter)| HeapWrapper(i, iter)),
-        );
+        let mut bheap =
+            BinaryHeap::from_iter(iters.into_iter().enumerate().filter_map(|(i, iter)| {
+                if iter.is_valid() {
+                    Some(HeapWrapper(i, iter))
+                } else {
+                    None
+                }
+            }));
 
-        // // remove all invalid iterators...
-        bheap.retain(|x| x.1.is_valid());
         if bheap.is_empty() {
             return MergeIterator {
                 iters: bheap,
@@ -64,14 +64,11 @@ impl<I: StorageIterator> MergeIterator<I> {
             };
         }
 
-        if let Some(inner_iter) = bheap.pop() {
-            return MergeIterator {
-                iters: bheap,
-                current: Some(inner_iter),
-            };
+        let current = bheap.pop().unwrap();
+        Self {
+            iters: bheap,
+            current: Some(current),
         }
-
-        unreachable!("Failed to create MergeIterator... this should never happen")
     }
 }
 
@@ -105,10 +102,6 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     }
 
     fn next(&mut self) -> Result<()> {
-        if !self.is_valid() {
-            bail!("Invalid iterator")
-        }
-
         // we want to advance all iterators that have the same key as the current iterator since we only want to return one item per key across all iterators
         // and we want to keep the invariant that the current iterator has the latest value for a given key
 
@@ -131,7 +124,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
             current.1.next()?;
         }
 
-        if self.current.as_ref().unwrap().1.is_valid() {
+        if self.is_valid() {
             self.iters.push(self.current.take().unwrap());
         }
 
