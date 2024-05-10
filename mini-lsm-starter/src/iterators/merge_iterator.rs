@@ -101,6 +101,17 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         }
     }
 
+    fn num_active_iterators(&self) -> usize {
+        self.iters
+            .iter()
+            .map(|x| x.1.num_active_iterators())
+            .sum::<usize>()
+            + self
+                .current
+                .as_ref()
+                .map_or(0, |i| i.1.num_active_iterators())
+    }
+
     fn next(&mut self) -> Result<()> {
         // we want to advance all iterators that have the same key as the current iterator since we only want to return one item per key across all iterators
         // and we want to keep the invariant that the current iterator has the latest value for a given key
