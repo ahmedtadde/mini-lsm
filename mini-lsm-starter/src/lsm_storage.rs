@@ -16,11 +16,14 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::iterators::StorageIterator;
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -280,21 +283,50 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let guard = self.state.read();
-        let reader = guard.as_ref();
-        if let Some(value) = reader.memtable.get(key) {
-            if value.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(value));
-        }
+        let reader = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
 
-        for imm_memtable in reader.imm_memtables.iter() {
-            if let Some(value) = imm_memtable.get(key) {
+        {
+            if let Some(value) = reader.memtable.get(key) {
                 if value.is_empty() {
                     return Ok(None);
                 }
                 return Ok(Some(value));
+            }
+
+            for imm_memtable in reader.imm_memtables.iter() {
+                if let Some(value) = imm_memtable.get(key) {
+                    if value.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(value));
+                }
+            }
+        }
+
+        {
+            let sstables = reader
+                .l0_sstables
+                .iter()
+                .chain(
+                    reader
+                        .levels
+                        .iter()
+                        .flat_map(|(_, sstables)| sstables.iter()),
+                )
+                .filter_map(|id| {
+                    let sst = reader.sstables.get(id).unwrap();
+                    SsTableIterator::create_and_seek_to_key(sst.clone(), KeySlice::from_slice(key))
+                        .ok()
+                })
+                .map(Box::new)
+                .collect::<Vec<Box<SsTableIterator>>>();
+
+            let iter = FusedIterator::new(MergeIterator::create(sstables));
+            if iter.is_valid() && iter.key().raw_ref() == key && !iter.value().is_empty() {
+                return Ok(Some(Bytes::copy_from_slice(iter.value())));
             }
         }
 
@@ -402,15 +434,79 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        let reader = self.state.read();
+        let reader = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
         let mut iters = Vec::with_capacity(1 + reader.imm_memtables.len());
         iters.push(Box::new(reader.memtable.scan(lower, upper)));
         for imm_memtable in reader.imm_memtables.iter() {
             iters.push(Box::new(imm_memtable.scan(lower, upper)));
         }
+        let memtables_merge_iter = MergeIterator::create(iters);
 
-        let merge_iter = MergeIterator::create(iters);
-        let lsm_iter = LsmIterator::new(merge_iter)?;
+        let sstables = reader
+            .l0_sstables
+            .iter()
+            .chain(
+                reader
+                    .levels
+                    .iter()
+                    .flat_map(|(_, sstables)| sstables.iter()),
+            )
+            .filter_map(|id| {
+                let sst = reader.sstables.get(id).unwrap();
+                let skip = match (lower, upper) {
+                    (Bound::Included(lower), _) => sst.last_key().raw_ref() < lower,
+                    (Bound::Excluded(lower), _) => sst.last_key().raw_ref() <= lower,
+                    (_, Bound::Included(upper)) => sst.first_key().raw_ref() > upper,
+                    (_, Bound::Excluded(upper)) => sst.first_key().raw_ref() >= upper,
+                    _ => false,
+                };
+
+                if skip {
+                    return None;
+                }
+
+                match lower {
+                    Bound::Included(key) => SsTableIterator::create_and_seek_to_key(
+                        sst.clone(),
+                        KeySlice::from_slice(key),
+                    )
+                    .ok(),
+                    Bound::Excluded(key) => {
+                        let mut iter = SsTableIterator::create_and_seek_to_key(
+                            sst.clone(),
+                            KeySlice::from_slice(key),
+                        )
+                        .unwrap();
+
+                        if iter.is_valid() && iter.key() == KeySlice::from_slice(key) {
+                            iter.next().unwrap();
+                        };
+
+                        Some(iter)
+                    }
+                    Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sst.clone()).ok(),
+                }
+            })
+            .map(Box::new)
+            .collect::<Vec<Box<SsTableIterator>>>();
+
+        let sstables_merge_iter = MergeIterator::create(sstables);
+
+        let merge_iter = TwoMergeIterator::create(memtables_merge_iter, sstables_merge_iter)?;
+        let lsm_iter = match upper {
+            Bound::Included(key) => LsmIterator::with_upper_bound(
+                merge_iter,
+                Bound::Included(Bytes::copy_from_slice(key)),
+            )?,
+            Bound::Excluded(key) => LsmIterator::with_upper_bound(
+                merge_iter,
+                Bound::Excluded(Bytes::copy_from_slice(key)),
+            )?,
+            Bound::Unbounded => LsmIterator::new(merge_iter)?,
+        };
         Ok(FusedIterator::new(lsm_iter))
     }
 }
