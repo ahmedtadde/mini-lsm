@@ -1,6 +1,8 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use bytes::Bytes;
+
 use crate::key::{KeySlice, KeyVec};
 
 use super::Block;
@@ -33,6 +35,26 @@ impl BlockBuilder {
         }
     }
 
+    pub fn compressed_key(&self, key: KeySlice) -> (u16, Bytes) {
+        let first_key_slice = self.first_key.raw_ref();
+        let input_key_slice = key.raw_ref();
+
+        // Find the overlap length
+        let overlap_len = first_key_slice
+            .iter()
+            .zip(input_key_slice.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        // Convert overlap length to u16 (ensure it fits within u16)
+        let overlap_len = overlap_len.min(u16::MAX as usize) as u16;
+
+        // Get the rest of the key that doesn't overlap
+        let rest_key = Bytes::copy_from_slice(&input_key_slice[overlap_len as usize..]);
+
+        (overlap_len, rest_key)
+    }
+
     /// Adds a key-value pair to the block. Returns false when the block is full.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
@@ -54,18 +76,20 @@ impl BlockBuilder {
             return false;
         }
 
-        if self.is_empty() {
-            self.first_key = key.to_key_vec();
-        }
-
         // Add the key-value pair to the block
         self.offsets.push(self.data.len() as u16);
+        let (key_prefix_len, truncated_key) = self.compressed_key(key);
+        self.data.extend_from_slice(&key_prefix_len.to_ne_bytes());
         self.data
-            .extend_from_slice(&(key.len() as u16).to_ne_bytes());
-        self.data.extend_from_slice(key.raw_ref());
+            .extend_from_slice(&(truncated_key.len() as u16).to_ne_bytes());
+        self.data.extend_from_slice(truncated_key.as_ref());
         self.data
             .extend_from_slice(&(value.len() as u16).to_ne_bytes());
         self.data.extend_from_slice(value);
+
+        if self.is_empty() {
+            self.first_key = key.to_key_vec();
+        }
 
         true
     }

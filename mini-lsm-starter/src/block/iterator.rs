@@ -77,17 +77,31 @@ impl BlockIterator {
         }
 
         let offset = self.block.offsets[self.idx] as usize;
-        let key_len =
+        let key_prefix_len =
             u16::from_ne_bytes([self.block.data[offset], self.block.data[offset + 1]]) as usize;
-        let key_start = offset + 2;
-        let key_end = key_start + key_len;
-        let value_len =
-            u16::from_ne_bytes([self.block.data[key_end], self.block.data[key_end + 1]]) as usize;
-        let value_start = key_end + 2;
+        let truncated_key_len =
+            u16::from_ne_bytes([self.block.data[offset + 2], self.block.data[offset + 3]]) as usize;
+        let truncated_key_start = offset + 4;
+        let truncated_key_end = truncated_key_start + truncated_key_len;
+        let value_len = u16::from_ne_bytes([
+            self.block.data[truncated_key_end],
+            self.block.data[truncated_key_end + 1],
+        ]) as usize;
+        let value_start = truncated_key_end + 2;
         let value_end = value_start + value_len;
 
-        self.key
-            .set_from_slice(KeySlice::from_slice(&self.block.data[key_start..key_end]));
+        match (key_prefix_len, truncated_key_len) {
+            (0, 0) => {
+                self.key.clear();
+            }
+            (key_prefix_len, truncated_key_len) => {
+                self.key.clear();
+                self.key.append(&self.first_key.raw_ref()[..key_prefix_len]);
+                self.key
+                    .append(&self.block.data[truncated_key_start..truncated_key_end]);
+            }
+        }
+
         self.value_range = (value_start, value_end);
 
         if self.idx == 0 {
@@ -105,13 +119,31 @@ impl BlockIterator {
         let mut right = self.block.offsets.len();
         while left < right {
             let mid = left + (right - left) / 2;
-            let offset = self.block.offsets[mid] as usize;
-            let key_len =
-                u16::from_ne_bytes([self.block.data[offset], self.block.data[offset + 1]]) as usize;
-            let key_start = offset + 2;
-            let key_end = key_start + key_len;
-            let key_slice = KeySlice::from_slice(&self.block.data[key_start..key_end]);
-            if key_slice < key {
+
+            let key_slice = {
+                let offset = self.block.offsets[self.idx] as usize;
+                let key_prefix_len =
+                    u16::from_ne_bytes([self.block.data[offset], self.block.data[offset + 1]])
+                        as usize;
+                let truncated_key_len =
+                    u16::from_ne_bytes([self.block.data[offset + 2], self.block.data[offset + 3]])
+                        as usize;
+                let truncated_key_start = offset + 4;
+                let truncated_key_end = truncated_key_start + truncated_key_len;
+
+                let mut key = KeyVec::new();
+
+                match (key_prefix_len, truncated_key_len) {
+                    (0, 0) => key,
+                    (key_prefix_len, truncated_key_len) => {
+                        key.append(&self.first_key.raw_ref()[..key_prefix_len]);
+                        key.append(&self.block.data[truncated_key_start..truncated_key_end]);
+                        key
+                    }
+                }
+            };
+
+            if key_slice.raw_ref() < key.raw_ref() {
                 left = mid + 1;
             } else {
                 right = mid;
