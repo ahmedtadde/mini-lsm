@@ -278,8 +278,28 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let storage = self.state.read();
+
+        if let Some(bytes) = storage.memtable.get(key) {
+            return Ok(if bytes.is_empty() {
+                None
+            } else {
+                Some(bytes.clone())
+            });
+        }
+
+        for mem_table in &storage.imm_memtables {
+            if let Some(bytes) = mem_table.get(key) {
+                return Ok(if bytes.is_empty() {
+                    None
+                } else {
+                    Some(bytes.clone())
+                });
+            }
+        }
+
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -288,13 +308,30 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let storage = self.state.read();
+        match storage.memtable.put(key, value) {
+            Ok(_) => {
+                if self.memtable_reaches_capacity_on_put(&storage) {
+                    let lock = self.state_lock.lock();
+                    if self.memtable_reaches_capacity_on_put(&storage) {
+                        drop(storage);
+                        return self.force_freeze_memtable(&lock);
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn memtable_reaches_capacity_on_put(&self, state: &LsmStorageState) -> bool {
+        self.options.target_sst_size <= state.memtable.approximate_size()
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.put(key, &[])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -319,7 +356,21 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let mut lock = self.state.write();
+        //为什么要克隆，保持state的整体引用不会突然发生变化？
+        //我在更新state.memtable时候会其改变指向。如果不克隆，其它线程就会发现state.memtable在使用中突然改变了。
+        let mut state = lock.as_ref().clone();
+
+        let mem_table = Arc::new(MemTable::create(self.next_sst_id()));
+        let old_mem_table = std::mem::replace(&mut state.memtable, mem_table);
+
+        state.imm_memtables.insert(0, old_mem_table);
+
+        // dereferencing RwLockWriteGuard
+        // 改完之后，更新回去
+        *lock = Arc::new(state);
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
