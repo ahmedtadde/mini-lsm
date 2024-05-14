@@ -144,14 +144,20 @@ impl SsTable {
         };
 
         let raw_data = file.read(0, file.size())?;
-        let block_meta_offset = u32::from_ne_bytes(
+        let bloom_offset = u32::from_ne_bytes(
             raw_data[file.size() as usize - 4..file.size() as usize]
                 .try_into()
                 .unwrap(),
         ) as usize;
 
+        let bloom = Bloom::decode(&raw_data[bloom_offset..file.size() as usize - 4])?;
+
+        let block_meta_offset =
+            u32::from_ne_bytes(raw_data[bloom_offset - 4..bloom_offset].try_into().unwrap())
+                as usize;
+
         let block_meta =
-            BlockMeta::decode_block_meta(&raw_data[block_meta_offset..(file.size() as usize - 4)]);
+            BlockMeta::decode_block_meta(&raw_data[block_meta_offset..(bloom_offset - 4)]);
 
         let first_key = block_meta
             .first()
@@ -170,7 +176,7 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }

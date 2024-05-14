@@ -12,13 +12,23 @@ use crate::{
     block::BlockBuilder,
     key::{KeySlice, KeyVec},
     lsm_storage::BlockCache,
+    table::bloom::Bloom,
 };
+
+///-----------------------------------------------------------------------------------------------------
+///|         Block Section         |                            Meta Section                           |
+///-----------------------------------------------------------------------------------------------------
+///| data block | ... | data block | metadata | meta block offset | bloom filter | bloom filter offset |
+///|                               |  varlen  |         u32       |    varlen    |        u32          |
+///-----------------------------------------------------------------------------------------------------
 
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
     first_key: Vec<u8>,
     last_key: Vec<u8>,
+    bloom_filter_key_hashes: Vec<u32>,
+    bloom_filter_false_positive_rate: f64,
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
@@ -32,6 +42,8 @@ impl SsTableBuilder {
             last_key: Vec::new(),
             builder: BlockBuilder::new(block_size),
             data: Vec::new(),
+            bloom_filter_key_hashes: Vec::new(),
+            bloom_filter_false_positive_rate: 0.01,
             meta: Vec::new(),
             block_size,
         }
@@ -56,6 +68,9 @@ impl SsTableBuilder {
             self.first_key = key.raw_ref().to_vec();
             self.last_key = key.raw_ref().to_vec();
         }
+
+        self.bloom_filter_key_hashes
+            .push(farmhash::fingerprint32(key.raw_ref()));
     }
 
     fn flush_and_replace_builder(&mut self, mut builder: BlockBuilder) -> Result<()> {
@@ -101,6 +116,23 @@ impl SsTableBuilder {
         buf.extend_from_slice(&block_meta);
         buf.put_u32_ne(metadata_offset.try_into().unwrap());
 
+        // build bloom filter and append to the end of the buffer
+        let bloom = {
+            let bits_per_key = Bloom::bloom_bits_per_key(
+                this.bloom_filter_key_hashes.len(),
+                this.bloom_filter_false_positive_rate,
+            );
+            let bloom = Bloom::build_from_key_hashes(&this.bloom_filter_key_hashes, bits_per_key);
+            assert!(bloom.k < 30);
+            bloom
+        };
+
+        let bloom_offset = buf.len();
+        let mut bloom_buf = Vec::new();
+        bloom.encode(&mut bloom_buf);
+        buf.extend_from_slice(&bloom_buf);
+        buf.put_u32_ne(bloom_offset.try_into().unwrap());
+
         let file = FileObject::create(path.as_ref(), buf.to_vec())?;
         let first_key = this
             .meta
@@ -122,7 +154,7 @@ impl SsTableBuilder {
             first_key,
             last_key,
             max_ts: 0,
-            bloom: None,
+            bloom: Some(bloom),
         })
     }
 

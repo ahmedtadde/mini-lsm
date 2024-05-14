@@ -333,8 +333,17 @@ impl LsmStorageInner {
                 )
                 .filter_map(|id| {
                     let sst = reader.sstables.get(id).unwrap();
-                    SsTableIterator::create_and_seek_to_key(sst.clone(), KeySlice::from_slice(key))
-                        .ok()
+                    sst.bloom.as_ref().and_then(|bloom| {
+                        if !bloom.may_contain(farmhash::fingerprint32(key)) {
+                            None
+                        } else {
+                            SsTableIterator::create_and_seek_to_key(
+                                sst.clone(),
+                                KeySlice::from_slice(key),
+                            )
+                            .ok()
+                        }
+                    })
                 })
                 .map(Box::new)
                 .collect::<Vec<Box<SsTableIterator>>>();
@@ -441,7 +450,7 @@ impl LsmStorageInner {
             if state.imm_memtables.is_empty() {
                 None
             } else {
-                state.imm_memtables.last().map(Arc::clone)
+                state.imm_memtables.last().cloned()
             }
         };
 
