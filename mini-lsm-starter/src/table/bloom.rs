@@ -82,9 +82,9 @@ impl Bloom {
         keys.iter().for_each(|key| {
             let mut h = *key;
             let delta = (h >> 17) | (h << 15);
-            for _ in 0..*key {
-                h = h.wrapping_add(delta);
+            for _ in 0..k {
                 filter.set_bit((h as usize) % nbits, true);
+                h = h.wrapping_add(delta);
             }
         });
 
@@ -104,10 +104,10 @@ impl Bloom {
             let delta = (key >> 17) | (key << 15);
             let mut key = key;
             for _ in 0..self.k {
-                key = key.wrapping_add(delta);
                 if !self.filter.get_bit((key as usize) % nbits) {
                     return false;
                 }
+                key = key.wrapping_add(delta);
             }
 
             true
