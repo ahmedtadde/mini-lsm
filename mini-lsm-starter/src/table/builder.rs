@@ -1,51 +1,56 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use std::iter;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes};
 
 use super::{BlockMeta, FileObject, SsTable};
-use crate::{
-    block::BlockBuilder,
-    key::{KeySlice, KeyVec},
-    lsm_storage::BlockCache,
-    table::bloom::Bloom,
-};
-
-///-----------------------------------------------------------------------------------------------------
-///|         Block Section         |                            Meta Section                           |
-///-----------------------------------------------------------------------------------------------------
-///| data block | ... | data block | metadata | meta block offset | bloom filter | bloom filter offset |
-///|                               |  varlen  |         u32       |    varlen    |        u32          |
-///-----------------------------------------------------------------------------------------------------
+use crate::block::BlockIterator;
+use crate::key::KeyBytes;
+use crate::table::bloom::Bloom;
+use crate::{block::BlockBuilder, key::KeySlice, lsm_storage::BlockCache};
 
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
     first_key: Vec<u8>,
     last_key: Vec<u8>,
-    bloom_filter_key_hashes: Vec<u32>,
-    bloom_filter_false_positive_rate: f64,
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    key_hashes: Vec<u32>,
+}
+
+/// see this https://users.rust-lang.org/t/how-to-find-common-prefix-of-two-byte-slices-effectively/25815/3
+fn mismatch(xs: &[u8], ys: &[u8]) -> usize {
+    mismatch_chunks::<128>(xs, ys)
+}
+
+fn mismatch_chunks<const N: usize>(xs: &[u8], ys: &[u8]) -> usize {
+    let off = iter::zip(xs.chunks_exact(N), ys.chunks_exact(N))
+        .take_while(|(x, y)| x == y)
+        .count()
+        * N;
+    off + iter::zip(&xs[off..], &ys[off..])
+        .take_while(|(x, y)| x == y)
+        .count()
 }
 
 impl SsTableBuilder {
     /// Create a builder based on target block size.
     pub fn new(block_size: usize) -> Self {
         Self {
-            first_key: Vec::new(),
-            last_key: Vec::new(),
             builder: BlockBuilder::new(block_size),
-            data: Vec::new(),
-            bloom_filter_key_hashes: Vec::new(),
-            bloom_filter_false_positive_rate: 0.01,
-            meta: Vec::new(),
+            first_key: vec![],
+            last_key: vec![],
+            data: vec![],
+            meta: vec![],
             block_size,
+            key_hashes: Default::default(),
         }
     }
 
@@ -54,36 +59,38 @@ impl SsTableBuilder {
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
-        let ok = self.builder.add(key, value);
-
-        if ok {
-            self.last_key = key.raw_ref().to_vec();
-            if self.first_key.is_empty() {
-                self.first_key = key.raw_ref().to_vec();
-            }
-        } else {
-            let mut builder = BlockBuilder::new(self.block_size);
-            let _ = builder.add(key, value);
-            self.flush_and_replace_builder(builder).unwrap();
+        if self.first_key.is_empty() {
             self.first_key = key.raw_ref().to_vec();
-            self.last_key = key.raw_ref().to_vec();
         }
 
-        self.bloom_filter_key_hashes
-            .push(farmhash::fingerprint32(key.raw_ref()));
+        let prefix_len = mismatch(&self.first_key, key.raw_ref());
+        let suc = self.builder.add_with_prefix(key, prefix_len, value);
+        if !suc {
+            self.split_block();
+            let _ = self.builder.add_with_prefix(key, prefix_len, value);
+        }
+        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
     }
 
-    fn flush_and_replace_builder(&mut self, mut builder: BlockBuilder) -> Result<()> {
-        std::mem::swap(&mut self.builder, &mut builder);
-        let block = builder.build();
+    fn split_block(&mut self) {
+        let block = std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
+        let block = Arc::new(block.build());
         let offset = self.data.len();
-        self.data.extend_from_slice(&block.encode());
-        self.meta.push(BlockMeta {
+
+        let iter = BlockIterator::new_with_prefix(
+            block.clone(),
+            Some(KeyBytes::from_bytes(Bytes::copy_from_slice(
+                &self.first_key,
+            ))),
+        );
+
+        let block_meta = BlockMeta {
             offset,
-            first_key: KeyVec::from_vec(self.first_key.clone()).into_key_bytes(),
-            last_key: KeyVec::from_vec(self.last_key.clone()).into_key_bytes(),
-        });
-        Ok(())
+            first_key: iter.first_key().unwrap_or_default().into_key_bytes(),
+            last_key: iter.last_key().unwrap_or_default().into_key_bytes(),
+        };
+        self.meta.push(block_meta);
+        self.data.extend_from_slice(&block.encode());
     }
 
     /// Get the estimated size of the SSTable.
@@ -94,6 +101,10 @@ impl SsTableBuilder {
         self.data.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty() && self.builder.is_empty()
+    }
+
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
     pub fn build(
         self,
@@ -101,60 +112,46 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
-        // ensure the last block is flushed
-        let mut this = self;
-        if !this.builder.is_empty() {
-            let builder = BlockBuilder::new(this.block_size);
-            this.flush_and_replace_builder(builder)?;
-        };
+        let mut sst_builder = self;
+        sst_builder.split_block();
 
-        let mut buf = BytesMut::new();
-        buf.extend_from_slice(&this.data);
-        let metadata_offset = buf.len();
-        let mut block_meta = Vec::new();
-        BlockMeta::encode_block_meta(&this.meta, &mut block_meta);
-        buf.extend_from_slice(&block_meta);
-        buf.put_u32_ne(metadata_offset.try_into().unwrap());
+        let mut bytes = vec![];
+        bytes.extend_from_slice(&sst_builder.data);
 
-        // build bloom filter and append to the end of the buffer
-        let bloom = {
-            let bits_per_key = Bloom::bloom_bits_per_key(
-                this.bloom_filter_key_hashes.len(),
-                this.bloom_filter_false_positive_rate,
-            );
-            let bloom = Bloom::build_from_key_hashes(&this.bloom_filter_key_hashes, bits_per_key);
-            assert!(bloom.k < 30);
-            bloom
-        };
-
-        let bloom_offset = buf.len();
-        let mut bloom_buf = Vec::new();
-        bloom.encode(&mut bloom_buf);
-        buf.extend_from_slice(&bloom_buf);
-        buf.put_u32_ne(bloom_offset.try_into().unwrap());
-
-        let file = FileObject::create(path.as_ref(), buf.to_vec())?;
-        let first_key = this
+        let block_meta_offset = bytes.len();
+        let first_key = sst_builder
             .meta
             .first()
-            .map(|x| x.first_key.clone())
+            .map(|meta| meta.first_key.clone())
             .unwrap_or_default();
-        let last_key = this
+        let last_key = sst_builder
             .meta
             .last()
-            .map(|x| x.last_key.clone())
+            .map(|meta| meta.last_key.clone())
             .unwrap_or_default();
+        BlockMeta::encode_block_meta(&sst_builder.meta, &mut bytes);
+
+        bytes.put_u32(block_meta_offset as u32);
+
+        let bloom_offset = bytes.len();
+        let bits_per_key = Bloom::bloom_bits_per_key(sst_builder.key_hashes.len(), 0.01);
+        let bloom = Bloom::build_from_key_hashes(&sst_builder.key_hashes, bits_per_key);
+        bloom.encode(&mut bytes);
+
+        bytes.put_u32(bloom_offset as u32);
+
+        let file = FileObject::create(path.as_ref(), bytes)?;
 
         Ok(SsTable {
             file,
-            block_meta: this.meta,
-            block_meta_offset: metadata_offset,
+            block_meta: sst_builder.meta,
+            block_meta_offset,
             id,
             block_cache,
             first_key,
             last_key,
-            max_ts: 0,
             bloom: Some(bloom),
+            max_ts: 0,
         })
     }
 

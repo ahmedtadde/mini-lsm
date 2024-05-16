@@ -1,15 +1,16 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 pub(crate) mod bloom;
 mod builder;
 mod iterator;
 
+use std::collections::Bound;
 use std::fs::File;
+use std::io::{Read, Seek};
+use std::mem::size_of;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, Result};
 pub use builder::SsTableBuilder;
 use bytes::{Buf, BufMut};
 pub use iterator::SsTableIterator;
@@ -129,47 +130,39 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        if file.size() == 0 {
-            return Ok(Self {
-                file,
-                block_meta: vec![],
-                block_meta_offset: 0,
-                id,
-                block_cache,
-                first_key: KeyBytes::default(),
-                last_key: KeyBytes::default(),
-                bloom: None,
-                max_ts: 0,
-            });
+        let (mut file, file_size) = match file.0 {
+            Some(f) => (f, file.1),
+            None => return Err(anyhow!("file not exists")),
         };
 
-        let raw_data = file.read(0, file.size())?;
-        let bloom_offset = u32::from_ne_bytes(
-            raw_data[file.size() as usize - 4..file.size() as usize]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        let bytes = {
+            let mut bytes = vec![0; file_size as usize];
+            file.read_exact(&mut bytes)?;
+            bytes
+        };
 
-        let bloom = Bloom::decode(&raw_data[bloom_offset..file.size() as usize - 4])?;
+        const U32_SIZE: usize = size_of::<u32>();
+        let bloom_offset = (&bytes[bytes.len() - U32_SIZE..]).get_u32() as usize;
+        let bloom = &bytes[bloom_offset..bytes.len() - U32_SIZE];
+        let bloom = Bloom::decode(bloom)?;
 
-        let block_meta_offset =
-            u32::from_ne_bytes(raw_data[bloom_offset - 4..bloom_offset].try_into().unwrap())
-                as usize;
+        let bytes = &bytes[..bloom_offset];
+        let block_meta_offset = (&bytes[bytes.len() - U32_SIZE..]).get_u32() as usize;
 
-        let block_meta =
-            BlockMeta::decode_block_meta(&raw_data[block_meta_offset..(bloom_offset - 4)]);
-
+        let block_meta = &bytes[block_meta_offset..bytes.len() - U32_SIZE];
+        let block_meta = BlockMeta::decode_block_meta(block_meta);
         let first_key = block_meta
             .first()
-            .map(|x| x.first_key.clone())
+            .map(|meta| meta.first_key.clone())
             .unwrap_or_default();
         let last_key = block_meta
             .last()
-            .map(|x| x.last_key.clone())
+            .map(|meta| meta.last_key.clone())
             .unwrap_or_default();
 
+        file.rewind()?;
         Ok(Self {
-            file,
+            file: FileObject(Some(file), file_size),
             block_meta,
             block_meta_offset,
             id,
@@ -203,22 +196,24 @@ impl SsTable {
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
-        if self.block_meta.is_empty() {
-            bail!("sstable is empty");
-        }
-
-        if block_idx >= self.block_meta.len() {
-            bail!("Block index out of range");
-        }
-
-        let offset = self.block_meta[block_idx].offset as u64;
-        let next_offset = if block_idx + 1 < self.block_meta.len() {
-            self.block_meta[block_idx + 1].offset as u64
-        } else {
-            self.block_meta_offset as u64
+        let file = match &self.file.0 {
+            Some(f) => f,
+            None => return Err(anyhow!("File not exists")),
         };
-        let data = self.file.read(offset, next_offset - offset)?;
-        Ok(Arc::new(Block::decode(&data)))
+
+        let (start, length) = match (
+            self.block_meta.get(block_idx),
+            self.block_meta.get(block_idx + 1),
+        ) {
+            (Some(fir), Some(sec)) => (fir.offset, sec.offset - fir.offset),
+            (Some(fir), None) => (fir.offset, self.block_meta_offset - fir.offset),
+            _ => return Ok(Arc::default()),
+        };
+
+        let mut buffer = vec![0; length];
+        file.read_exact_at(&mut buffer, start as u64)?;
+
+        Ok(Arc::new(Block::decode(&buffer)))
     }
 
     /// Read a block from disk, with block cache. (Day 4)
@@ -239,8 +234,8 @@ impl SsTable {
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
         self.block_meta
-            .partition_point(|meta| meta.first_key.as_key_slice() <= key)
-            .saturating_sub(1)
+            .binary_search_by_key(&key, |b| b.first_key.as_key_slice())
+            .unwrap_or_else(|idx| idx)
     }
 
     /// Get number of data blocks.
@@ -266,5 +261,34 @@ impl SsTable {
 
     pub fn max_ts(&self) -> u64 {
         self.max_ts
+    }
+
+    pub fn key_is_within_range(&self, key: &KeySlice) -> bool {
+        self.first_key.raw_ref() <= key.raw_ref() && key.raw_ref() <= self.last_key.raw_ref()
+    }
+
+    pub fn may_contain_key(&self, key: &KeySlice) -> bool {
+        if let Some(bloom) = &self.bloom {
+            let hash = farmhash::fingerprint32(key.raw_ref());
+            bloom.may_contain(hash)
+        } else {
+            self.first_key.raw_ref() <= key.raw_ref() && key.raw_ref() <= self.last_key.raw_ref()
+        }
+    }
+
+    pub fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+        match upper {
+            Bound::Included(upper) if upper < self.first_key.raw_ref() => return false,
+            Bound::Excluded(upper) if upper <= self.first_key.raw_ref() => return false,
+            _ => {}
+        };
+
+        match lower {
+            Bound::Included(lower) if self.last_key.raw_ref() < lower => return false,
+            Bound::Excluded(lower) if self.last_key.raw_ref() <= lower => return false,
+            _ => {}
+        };
+
+        true
     }
 }
