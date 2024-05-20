@@ -64,8 +64,8 @@ impl SsTableBuilder {
         }
 
         let prefix_len = mismatch(&self.first_key, key.raw_ref());
-        let suc = self.builder.add_with_prefix(key, prefix_len, value);
-        if !suc {
+        let ok = self.builder.add_with_prefix(key, prefix_len, value);
+        if !ok {
             self.split_block();
             let _ = self.builder.add_with_prefix(key, prefix_len, value);
         }
