@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Ok, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -15,6 +15,7 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
@@ -322,33 +323,52 @@ impl LsmStorageInner {
         }
 
         {
-            let sstables = reader
-                .l0_sstables
-                .iter()
-                .chain(
+            let sstables = {
+                let l0_sstables_iter = MergeIterator::create(
+                    reader
+                        .l0_sstables
+                        .iter()
+                        .filter_map(|id| {
+                            let sst = reader.sstables.get(id).unwrap();
+                            sst.bloom.as_ref().and_then(|bloom| {
+                                if !bloom.may_contain(farmhash::fingerprint32(key)) {
+                                    None
+                                } else {
+                                    SsTableIterator::create_and_seek_to_key(
+                                        sst.clone(),
+                                        KeySlice::from_slice(key),
+                                    )
+                                    .ok()
+                                }
+                            })
+                        })
+                        .map(Box::new)
+                        .collect::<Vec<Box<SsTableIterator>>>(),
+                );
+
+                let other_sstables_iter = SstConcatIterator::create_and_seek_to_key(
                     reader
                         .levels
                         .iter()
-                        .flat_map(|(_, sstables)| sstables.iter()),
-                )
-                .filter_map(|id| {
-                    let sst = reader.sstables.get(id).unwrap();
-                    sst.bloom.as_ref().and_then(|bloom| {
-                        if !bloom.may_contain(farmhash::fingerprint32(key)) {
-                            None
-                        } else {
-                            SsTableIterator::create_and_seek_to_key(
-                                sst.clone(),
-                                KeySlice::from_slice(key),
-                            )
-                            .ok()
-                        }
-                    })
-                })
-                .map(Box::new)
-                .collect::<Vec<Box<SsTableIterator>>>();
+                        .flat_map(|(_, sstables)| sstables.iter())
+                        .filter_map(|id| {
+                            let sst = reader.sstables.get(id).unwrap();
+                            sst.bloom.as_ref().and_then(|bloom| {
+                                if !bloom.may_contain(farmhash::fingerprint32(key)) {
+                                    None
+                                } else {
+                                    Some(sst.clone())
+                                }
+                            })
+                        })
+                        .collect(),
+                    KeySlice::from_slice(key),
+                )?;
 
-            let iter = FusedIterator::new(MergeIterator::create(sstables));
+                TwoMergeIterator::create(l0_sstables_iter, other_sstables_iter)
+            }?;
+
+            let iter = FusedIterator::new(sstables);
             if iter.is_valid() && iter.key().raw_ref() == key && !iter.value().is_empty() {
                 return Ok(Some(Bytes::copy_from_slice(iter.value())));
             }
@@ -502,15 +522,9 @@ impl LsmStorageInner {
         }
         let memtables_merge_iter = MergeIterator::create(iters);
 
-        let sstables = reader
+        let l0_sstables = reader
             .l0_sstables
             .iter()
-            .chain(
-                reader
-                    .levels
-                    .iter()
-                    .flat_map(|(_, sstables)| sstables.iter()),
-            )
             .filter_map(|id| {
                 let sst = reader.sstables.get(id).unwrap();
                 let skip = match (lower, upper) {
@@ -550,9 +564,57 @@ impl LsmStorageInner {
             .map(Box::new)
             .collect::<Vec<Box<SsTableIterator>>>();
 
-        let sstables_merge_iter = MergeIterator::create(sstables);
+        let l0_sstables_merge_iter = MergeIterator::create(l0_sstables);
 
-        let merge_iter = TwoMergeIterator::create(memtables_merge_iter, sstables_merge_iter)?;
+        let mentables_and_l0_sstables_merge_iter =
+            TwoMergeIterator::create(memtables_merge_iter, l0_sstables_merge_iter)?;
+
+        let other_sstables = reader
+            .levels
+            .iter()
+            .flat_map(|(_, sstables)| sstables.iter())
+            .filter_map(|id| {
+                let sst = reader.sstables.get(id).unwrap();
+                let skip = match (lower, upper) {
+                    (Bound::Included(lower), _) => sst.last_key().raw_ref() < lower,
+                    (Bound::Excluded(lower), _) => sst.last_key().raw_ref() <= lower,
+                    (_, Bound::Included(upper)) => sst.first_key().raw_ref() > upper,
+                    (_, Bound::Excluded(upper)) => sst.first_key().raw_ref() >= upper,
+                    _ => false,
+                };
+
+                if skip {
+                    return None;
+                }
+
+                Some(sst.clone())
+            })
+            .collect::<Vec<Arc<SsTable>>>();
+
+        let other_tables_concat_iter = match (lower, upper) {
+            (Bound::Included(key), _) => SstConcatIterator::create_and_seek_to_key(
+                other_sstables,
+                KeySlice::from_slice(key),
+            )?,
+            (Bound::Excluded(key), _) => {
+                let mut iter = SstConcatIterator::create_and_seek_to_key(
+                    other_sstables,
+                    KeySlice::from_slice(key),
+                )?;
+
+                if iter.is_valid() && iter.key() == KeySlice::from_slice(key) {
+                    iter.next()?;
+                };
+                iter
+            }
+            (Bound::Unbounded, _) => SstConcatIterator::create_and_seek_to_first(other_sstables)?,
+        };
+
+        let merge_iter = TwoMergeIterator::create(
+            mentables_and_l0_sstables_merge_iter,
+            other_tables_concat_iter,
+        )?;
+
         let lsm_iter = match upper {
             Bound::Included(key) => LsmIterator::with_upper_bound(
                 merge_iter,

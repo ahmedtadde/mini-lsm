@@ -15,7 +15,9 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::lsm_iterator::FusedIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
@@ -122,18 +124,29 @@ impl LsmStorageInner {
                         Arc::clone(&guard)
                     };
 
-                    l0_sstables
+                    let l0_sstables_iter = l0_sstables
                         .iter()
-                        .chain(l1_sstables.iter())
                         .filter_map(|id| {
                             let sst = reader.sstables.get(id).unwrap();
                             SsTableIterator::create_and_seek_to_first(sst.clone()).ok()
                         })
                         .map(Box::new)
-                        .collect::<Vec<Box<SsTableIterator>>>()
-                };
+                        .collect::<Vec<Box<SsTableIterator>>>();
 
-                let mut sstable_iter = FusedIterator::new(MergeIterator::create(sstables));
+                    let l1_sstables_iter = SstConcatIterator::create_and_seek_to_first(
+                        l1_sstables
+                            .iter()
+                            .map(|id| reader.sstables.get(id).unwrap().clone())
+                            .collect(),
+                    )?;
+
+                    TwoMergeIterator::create(
+                        MergeIterator::create(l0_sstables_iter),
+                        l1_sstables_iter,
+                    )
+                }?;
+
+                let mut sstable_iter = FusedIterator::new(sstables);
 
                 let mut new_sstables = Vec::with_capacity(l0_sstables.len() + l1_sstables.len());
                 let mut sst_builder = SsTableBuilder::new(self.options.block_size);
