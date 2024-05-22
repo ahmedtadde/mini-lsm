@@ -59,7 +59,7 @@ impl Block {
         let num_entries = u16::from_ne_bytes(num_entries.as_slice().try_into().unwrap());
         let mut offsets = Vec::with_capacity(num_entries as usize);
         for idx in (0..num_entries).rev() {
-            let offset = data.split_off(data.len() - 2).to_vec();
+            let offset = data.split_off(data.len().saturating_sub(2)).to_vec();
             offsets.push(u16::from_ne_bytes(offset.as_slice().try_into().unwrap()));
         }
 

@@ -142,6 +142,12 @@ impl SsTableBuilder {
 
         let file = FileObject::create(path.as_ref(), bytes)?;
 
+        assert!(
+            path.as_ref().exists(),
+            "path does not exists: {:?}",
+            path.as_ref()
+        );
+
         Ok(SsTable {
             file,
             block_meta: sst_builder.meta,

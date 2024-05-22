@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::lsm_storage::LsmStorageState;
@@ -25,6 +26,7 @@ pub struct SimpleLeveledCompactionController {
 
 impl SimpleLeveledCompactionController {
     pub fn new(options: SimpleLeveledCompactionOptions) -> Self {
+        assert!(options.max_levels > 0);
         Self { options }
     }
 
@@ -33,9 +35,81 @@ impl SimpleLeveledCompactionController {
     /// Returns `None` if no compaction needs to be scheduled. The order of SSTs in the compaction task id vector matters.
     pub fn generate_compaction_task(
         &self,
-        _snapshot: &LsmStorageState,
+        snapshot: &LsmStorageState,
     ) -> Option<SimpleLeveledCompactionTask> {
-        unimplemented!()
+        assert!(snapshot.levels.len() <= self.options.max_levels,
+            "The number of levels in the snapshot is greater than the maximum number of levels allowed by the compaction controller"
+        );
+
+        if snapshot.levels.is_empty() {
+            return None;
+        }
+
+        if snapshot.l0_sstables.len() >= self.options.level0_file_num_compaction_trigger {
+            return Some(SimpleLeveledCompactionTask {
+                upper_level: None,
+                upper_level_sst_ids: snapshot.l0_sstables.clone(),
+                lower_level: 1,
+                lower_level_sst_ids: snapshot
+                    .levels
+                    .first()
+                    .map_or(vec![], |ssts| ssts.1.to_vec()),
+                is_lower_level_bottom_level: true,
+            });
+        }
+
+        if snapshot.levels.len() == 1 {
+            return None;
+        }
+
+        snapshot
+            .levels
+            .iter()
+            .take(self.options.max_levels)
+            .tuple_windows()
+            .find_map(|(upper_lvl, lower_lvl)| {
+                // let upper_lvl_size = upper_lvl
+                //     .1
+                //     .iter()
+                //     .map(|sst| {
+                //         snapshot
+                //             .sstables
+                //             .get(sst)
+                //             .map_or(0, |v| v.table_size() as usize)
+                //     })
+                //     .sum::<usize>();
+                // let lower_lvl_size = lower_lvl
+                //     .1
+                //     .iter()
+                //     .map(|sst| {
+                //         snapshot
+                //             .sstables
+                //             .get(sst)
+                //             .map_or(0, |v| v.table_size() as usize)
+                //     })
+                //     .sum::<usize>();
+
+                let upper_lvl_size = upper_lvl.1.len();
+                let lower_lvl_size = lower_lvl.1.len();
+
+                if upper_lvl_size == 0 {
+                    return None;
+                }
+
+                if (lower_lvl_size as f32 / upper_lvl_size as f32) * 100.0
+                    < self.options.size_ratio_percent as f32
+                {
+                    return Some(SimpleLeveledCompactionTask {
+                        upper_level: Some(upper_lvl.0),
+                        upper_level_sst_ids: upper_lvl.1.to_vec(),
+                        lower_level: lower_lvl.0,
+                        lower_level_sst_ids: lower_lvl.1.to_vec(),
+                        is_lower_level_bottom_level: true,
+                    });
+                }
+
+                None
+            })
     }
 
     /// Apply the compaction result.
@@ -47,10 +121,35 @@ impl SimpleLeveledCompactionController {
     /// in your implementation.
     pub fn apply_compaction_result(
         &self,
-        _snapshot: &LsmStorageState,
-        _task: &SimpleLeveledCompactionTask,
-        _output: &[usize],
+        snapshot: &LsmStorageState,
+        task: &SimpleLeveledCompactionTask,
+        output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
-        unimplemented!()
+        let mut snapshot = snapshot.clone();
+
+        match task.upper_level {
+            Some(upper_level) => {
+                assert!(upper_level > 0 && upper_level <= snapshot.levels.len());
+                // clear the current upper (non L0) level sstables
+                snapshot.levels[upper_level - 1].1.clear();
+            }
+            None => {
+                assert!(task.lower_level == 1);
+                // clear the current L0 sstables
+                snapshot.l0_sstables.clear();
+            }
+        }
+
+        assert!(task.lower_level > 0 && task.lower_level <= snapshot.levels.len());
+        snapshot.levels[task.lower_level - 1].1 = output.to_vec();
+
+        (
+            snapshot,
+            task.upper_level_sst_ids
+                .iter()
+                .chain(task.lower_level_sst_ids.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
     }
 }
