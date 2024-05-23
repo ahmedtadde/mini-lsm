@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
@@ -37,15 +39,21 @@ impl SimpleLeveledCompactionController {
         &self,
         snapshot: &LsmStorageState,
     ) -> Option<SimpleLeveledCompactionTask> {
+        assert!(
+            self.options.max_levels > 0,
+            "The maximum number of levels should be greater than 0"
+        );
         assert!(snapshot.levels.len() <= self.options.max_levels,
             "The number of levels in the snapshot is greater than the maximum number of levels allowed by the compaction controller"
         );
 
-        if snapshot.levels.is_empty() {
-            return None;
-        }
-
         if snapshot.l0_sstables.len() >= self.options.level0_file_num_compaction_trigger {
+            println!(
+                "compaction triggered at level 0 which has {} files and the threshold is {}",
+                snapshot.l0_sstables.len(),
+                self.options.level0_file_num_compaction_trigger
+            );
+
             return Some(SimpleLeveledCompactionTask {
                 upper_level: None,
                 upper_level_sst_ids: snapshot.l0_sstables.clone(),
@@ -54,12 +62,8 @@ impl SimpleLeveledCompactionController {
                     .levels
                     .first()
                     .map_or(vec![], |ssts| ssts.1.to_vec()),
-                is_lower_level_bottom_level: true,
+                is_lower_level_bottom_level: self.options.max_levels == 1,
             });
-        }
-
-        if snapshot.levels.len() == 1 {
-            return None;
         }
 
         snapshot
@@ -96,15 +100,24 @@ impl SimpleLeveledCompactionController {
                     return None;
                 }
 
-                if (lower_lvl_size as f32 / upper_lvl_size as f32) * 100.0
-                    < self.options.size_ratio_percent as f32
+                if (lower_lvl_size as f64 / upper_lvl_size as f64) * 100.0
+                    < self.options.size_ratio_percent as f64
                 {
+                    println!(
+                        "compaction triggered at level {} (size={}) and level {} (size={}) where the size ratio is {} which is less than the threshold {}",
+                        upper_lvl.0, 
+                        upper_lvl_size,
+                        lower_lvl.0, 
+                        lower_lvl_size,
+                        (lower_lvl_size as f64 / upper_lvl_size as f64) * 100.0,
+                        self.options.size_ratio_percent
+                    );
                     return Some(SimpleLeveledCompactionTask {
                         upper_level: Some(upper_lvl.0),
                         upper_level_sst_ids: upper_lvl.1.to_vec(),
                         lower_level: lower_lvl.0,
                         lower_level_sst_ids: lower_lvl.1.to_vec(),
-                        is_lower_level_bottom_level: true,
+                        is_lower_level_bottom_level: lower_lvl.0 == self.options.max_levels,
                     });
                 }
 
@@ -131,12 +144,14 @@ impl SimpleLeveledCompactionController {
             Some(upper_level) => {
                 assert!(upper_level > 0 && upper_level <= snapshot.levels.len());
                 // clear the current upper (non L0) level sstables
-                snapshot.levels[upper_level - 1].1.clear();
+                let upper_level_sst_ids = task.upper_level_sst_ids.iter().cloned().collect::<HashSet<_>>();
+                snapshot.levels[upper_level - 1].1.retain(|id| !upper_level_sst_ids.contains(id));
             }
             None => {
                 assert!(task.lower_level == 1);
                 // clear the current L0 sstables
-                snapshot.l0_sstables.clear();
+                let l0_sst_ids = task.upper_level_sst_ids.iter().cloned().collect::<HashSet<_>>();
+                snapshot.l0_sstables.retain(|id| !l0_sst_ids.contains(id));
             }
         }
 

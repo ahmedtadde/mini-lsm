@@ -119,7 +119,7 @@ impl LsmStorageInner {
             CompactionTask::ForceFullCompaction {
                 l0_sstables,
                 l1_sstables,
-            } => self.full_compaction(l0_sstables, l1_sstables),
+            } => self.full_compaction(l0_sstables, l1_sstables, true),
             _ => unimplemented!(),
         }
     }
@@ -138,6 +138,7 @@ impl LsmStorageInner {
             return self.full_compaction(
                 task.upper_level_sst_ids.as_slice(),
                 task.lower_level_sst_ids.as_slice(),
+                task.is_lower_level_bottom_level,
             );
         }
 
@@ -174,12 +175,16 @@ impl LsmStorageInner {
         while sstable_iter.is_valid() {
             let key = sstable_iter.key();
             let value = sstable_iter.value();
-            if value.is_empty() {
-                sstable_iter.next()?;
-                continue;
+
+            if task.is_lower_level_bottom_level {
+                if !value.is_empty() {
+                    sst_builder.add(key, value);
+                }
+            } else {
+                sst_builder.add(key, value);
             }
 
-            sst_builder.add(key, value);
+            sstable_iter.next()?;
 
             if sst_builder.estimated_size() >= self.options.target_sst_size {
                 let builder = std::mem::replace(
@@ -187,16 +192,23 @@ impl LsmStorageInner {
                     SsTableBuilder::new(self.options.block_size),
                 );
                 let sstable_id = self.next_sst_id();
-                let sstable = builder.build(sstable_id, None, self.path_of_sst(sstable_id))?;
+                let sstable = builder.build(
+                    sstable_id,
+                    Some(self.block_cache.clone()),
+                    self.path_of_sst(sstable_id),
+                )?;
 
                 new_sstables.push(Arc::new(sstable));
             }
-            sstable_iter.next()?;
         }
 
         if !sst_builder.is_empty() {
             let sstable_id = self.next_sst_id();
-            let sstable = sst_builder.build(sstable_id, None, self.path_of_sst(sstable_id))?;
+            let sstable = sst_builder.build(
+                sstable_id,
+                Some(self.block_cache.clone()),
+                self.path_of_sst(sstable_id),
+            )?;
             new_sstables.push(Arc::new(sstable));
         }
 
@@ -207,6 +219,7 @@ impl LsmStorageInner {
         &self,
         l0_sstables: &[usize],
         l1_sstables: &[usize],
+        is_lower_level_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
         let sstables = {
             let reader = {
@@ -216,10 +229,8 @@ impl LsmStorageInner {
 
             let l0_sstables_iter = l0_sstables
                 .iter()
-                .filter_map(|id| {
-                    let sst = reader.sstables.get(id).unwrap();
-                    SsTableIterator::create_and_seek_to_first(sst.clone()).ok()
-                })
+                .filter_map(|id| reader.sstables.get(id))
+                .filter_map(|sst| SsTableIterator::create_and_seek_to_first(sst.clone()).ok())
                 .map(Box::new)
                 .collect::<Vec<Box<SsTableIterator>>>();
 
@@ -242,12 +253,16 @@ impl LsmStorageInner {
         while sstable_iter.is_valid() {
             let key = sstable_iter.key();
             let value = sstable_iter.value();
-            if value.is_empty() {
-                sstable_iter.next()?;
-                continue;
+
+            if is_lower_level_bottom_level {
+                if !value.is_empty() {
+                    sst_builder.add(key, value);
+                }
+            } else {
+                sst_builder.add(key, value);
             }
 
-            sst_builder.add(key, value);
+            sstable_iter.next()?;
 
             if sst_builder.estimated_size() >= self.options.target_sst_size {
                 let builder = std::mem::replace(
@@ -263,7 +278,6 @@ impl LsmStorageInner {
 
                 new_sstables.push(Arc::new(sstable));
             }
-            sstable_iter.next()?;
         }
 
         if !sst_builder.is_empty() {
@@ -286,12 +300,7 @@ impl LsmStorageInner {
         };
 
         let l0_sstables = reader.l0_sstables.clone();
-        let l1_sstables = reader
-            .levels
-            .iter()
-            .take(1)
-            .flat_map(|item| item.1.clone())
-            .collect::<Vec<_>>();
+        let l1_sstables = reader.levels.first().map_or(vec![], |ssts| ssts.1.to_vec());
 
         let task = CompactionTask::ForceFullCompaction {
             l0_sstables: l0_sstables.clone(),
@@ -302,16 +311,13 @@ impl LsmStorageInner {
 
         let sstables_to_cleanup_from_fs = {
             let new_sstables = self.compact(&task)?;
+            let _state_lock = self.state_lock.lock();
             let mut guard = self.state.write();
             let mut writer = guard.as_ref().clone();
 
             writer
                 .l0_sstables
                 .truncate(writer.l0_sstables.len() - l0_sstables.len());
-
-            if let Some((_, level)) = writer.levels.first_mut() {
-                level.clear()
-            }
 
             let old_sst_ids = l0_sstables
                 .iter()
@@ -322,6 +328,7 @@ impl LsmStorageInner {
 
             match writer.levels.first_mut() {
                 Some((_, level)) => {
+                    level.clear();
                     level.extend(new_sstables.iter().map(|s| s.sst_id()));
                     level.sort_unstable();
                     level.reverse();
@@ -357,13 +364,15 @@ impl LsmStorageInner {
         };
 
         if let Some(task) = self.compaction_controller.generate_compaction_task(&reader) {
+            drop(reader);
             let new_sstables = self.compact(&task)?;
+            let _state_lock = self.state_lock.lock();
+            let mut writer = self.state.write();
             let (mut new_state, old_sst_ids) = self.compaction_controller.apply_compaction_result(
-                &reader,
+                writer.as_ref(),
                 &task,
                 &new_sstables.iter().map(|s| s.sst_id()).collect::<Vec<_>>(),
             );
-            drop(reader);
 
             {
                 for sst_id in &old_sst_ids {
@@ -374,9 +383,10 @@ impl LsmStorageInner {
                     new_state.sstables.insert(sst.sst_id(), sst);
                 }
 
-                let mut guard = self.state.write();
-                *guard = Arc::new(new_state);
+                *writer = Arc::new(new_state);
             }
+
+            drop(writer);
 
             for sst_id in old_sst_ids {
                 let path = self.path_of_sst(sst_id);
