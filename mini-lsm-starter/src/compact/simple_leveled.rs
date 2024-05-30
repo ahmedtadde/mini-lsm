@@ -105,9 +105,9 @@ impl SimpleLeveledCompactionController {
                 {
                     println!(
                         "compaction triggered at level {} (size={}) and level {} (size={}) where the size ratio is {} which is less than the threshold {}",
-                        upper_lvl.0, 
+                        upper_lvl.0,
                         upper_lvl_size,
-                        lower_lvl.0, 
+                        lower_lvl.0,
                         lower_lvl_size,
                         (lower_lvl_size as f64 / upper_lvl_size as f64) * 100.0,
                         self.options.size_ratio_percent
@@ -144,13 +144,23 @@ impl SimpleLeveledCompactionController {
             Some(upper_level) => {
                 assert!(upper_level > 0 && upper_level <= snapshot.levels.len());
                 // clear the current upper (non L0) level sstables
-                let upper_level_sst_ids = task.upper_level_sst_ids.iter().cloned().collect::<HashSet<_>>();
-                snapshot.levels[upper_level - 1].1.retain(|id| !upper_level_sst_ids.contains(id));
+                let upper_level_sst_ids = task
+                    .upper_level_sst_ids
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                snapshot.levels[upper_level - 1]
+                    .1
+                    .retain(|id| !upper_level_sst_ids.contains(id));
             }
             None => {
                 assert!(task.lower_level == 1);
                 // clear the current L0 sstables
-                let l0_sst_ids = task.upper_level_sst_ids.iter().cloned().collect::<HashSet<_>>();
+                let l0_sst_ids = task
+                    .upper_level_sst_ids
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>();
                 snapshot.l0_sstables.retain(|id| !l0_sst_ids.contains(id));
             }
         }

@@ -120,8 +120,75 @@ impl LsmStorageInner {
                 l0_sstables,
                 l1_sstables,
             } => self.full_compaction(l0_sstables, l1_sstables, true),
+            CompactionTask::Tiered(task) => self.tiered_compaction(task),
             _ => unimplemented!(),
         }
+    }
+
+    fn tiered_compaction(&self, task: &TieredCompactionTask) -> Result<Vec<Arc<SsTable>>> {
+        let sstables = {
+            let reader = self.state.read();
+            MergeIterator::create(
+                task.tiers
+                    .iter()
+                    .filter_map(|(_, sst_ids)| {
+                        SstConcatIterator::create_and_seek_to_first(
+                            sst_ids
+                                .iter()
+                                .filter_map(|id| reader.sstables.get(id))
+                                .cloned()
+                                .collect(),
+                        )
+                        .ok()
+                    })
+                    .map(Box::new)
+                    .collect::<Vec<Box<SstConcatIterator>>>(),
+            )
+        };
+
+        let mut sstable_iter = FusedIterator::new(sstables);
+        let mut new_sstables = Vec::new();
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+
+        while sstable_iter.is_valid() {
+            let key = sstable_iter.key();
+            let value = sstable_iter.value();
+
+            if value.is_empty() {
+                sstable_iter.next()?;
+                continue;
+            }
+
+            sst_builder.add(key, value);
+
+            if sst_builder.estimated_size() >= self.options.target_sst_size {
+                let builder = std::mem::replace(
+                    &mut sst_builder,
+                    SsTableBuilder::new(self.options.block_size),
+                );
+                let sstable_id = self.next_sst_id();
+                let sstable = builder.build(
+                    sstable_id,
+                    Some(self.block_cache.clone()),
+                    self.path_of_sst(sstable_id),
+                )?;
+
+                new_sstables.push(Arc::new(sstable));
+            }
+            sstable_iter.next()?;
+        }
+
+        if !sst_builder.is_empty() {
+            let sstable_id = self.next_sst_id();
+            let sstable = sst_builder.build(
+                sstable_id,
+                Some(self.block_cache.clone()),
+                self.path_of_sst(sstable_id),
+            )?;
+            new_sstables.push(Arc::new(sstable));
+        }
+
+        Ok(new_sstables)
     }
 
     fn simple_leveled_compaction(

@@ -479,6 +479,7 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
+        let _state_lock = self.state_lock.lock();
         let imm_memtable = {
             let guard = self.state.read();
             let state = guard.as_ref().clone();
@@ -507,7 +508,15 @@ impl LsmStorageInner {
             let mut guard = self.state.write();
             let mut state = guard.as_ref().clone();
             state.sstables.insert(imm_memtable.id(), Arc::new(sst));
-            state.l0_sstables.insert(0, imm_memtable.id());
+            {
+                if self.compaction_controller.flush_to_l0() {
+                    state.l0_sstables.insert(0, imm_memtable.id());
+                } else {
+                    state
+                        .levels
+                        .insert(0, (imm_memtable.id(), vec![imm_memtable.id()]));
+                }
+            }
             state.imm_memtables.pop();
             *guard = Arc::new(state);
         }
