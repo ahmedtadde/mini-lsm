@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 use crate::lsm_storage::LsmStorageState;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LeveledCompactionTask {
     // if upper_level is `None`, then it is L0 compaction
     pub upper_level: Option<usize>,

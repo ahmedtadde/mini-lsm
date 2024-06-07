@@ -23,9 +23,10 @@ use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_iterator::FusedIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum CompactionTask {
     Leveled(LeveledCompactionTask),
     Tiered(TieredCompactionTask),
@@ -355,7 +356,18 @@ impl LsmStorageInner {
 
         let sstables_to_cleanup_from_fs = {
             let new_sstables = self.compact(&task)?;
-            let _state_lock = self.state_lock.lock();
+            let state_lock = self.state_lock.lock();
+            if let Some(manifest) = self.manifest.as_ref() {
+                manifest.add_record(
+                    &state_lock,
+                    ManifestRecord::Compaction(
+                        task.clone(),
+                        new_sstables.iter().map(|s| s.sst_id()).collect(),
+                    ),
+                )?;
+
+                self.sync_dir_with_state_lock_observer(&state_lock)?;
+            }
             let mut guard = self.state.write();
             let mut writer = guard.as_ref().clone();
 
@@ -411,7 +423,20 @@ impl LsmStorageInner {
             drop(reader);
             let new_sstables = self.compact(&task)?;
 
-            let _state_lock = self.state_lock.lock();
+            let state_lock = self.state_lock.lock();
+
+            if let Some(manifest) = self.manifest.as_ref() {
+                manifest.add_record(
+                    &state_lock,
+                    ManifestRecord::Compaction(
+                        task.clone(),
+                        new_sstables.iter().map(|s| s.sst_id()).collect(),
+                    ),
+                )?;
+
+                self.sync_dir_with_state_lock_observer(&state_lock)?;
+            }
+
             let mut writer = self.state.write();
             let mut snapshot = writer.as_ref().clone();
             for sst in new_sstables.iter() {

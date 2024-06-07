@@ -1,7 +1,7 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
@@ -22,10 +22,10 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ManifestRecord, MANIFEST_FILE_PATH_SUFFIX};
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -155,6 +155,7 @@ impl Drop for MiniLsm {
     fn drop(&mut self) {
         self.compaction_notifier.send(()).ok();
         self.flush_notifier.send(()).ok();
+        self.close().ok();
     }
 }
 
@@ -175,6 +176,27 @@ impl MiniLsm {
                 .join()
                 .map_err(|e| anyhow!("there was an error shutting down flush thread: {:?}", e))?;
         }
+
+        {
+            self.inner
+                .force_freeze_memtable(&self.inner.state_lock.lock())?;
+        }
+
+        loop {
+            let snapshot = self.inner.state.read();
+
+            if snapshot.imm_memtables.is_empty() {
+                break;
+            }
+
+            drop(snapshot);
+
+            self.inner.force_flush_next_imm_memtable()?;
+        }
+
+        self.inner
+            .sync_dir_with_state_lock_observer(&self.inner.state_lock.lock())?;
+
         Ok(())
     }
 
@@ -263,7 +285,7 @@ impl LsmStorageInner {
         }
 
         fs::create_dir_all(path)?;
-        let state = LsmStorageState::create(&options);
+        let mut state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
@@ -278,18 +300,113 @@ impl LsmStorageInner {
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
 
+        let block_cache = Arc::new(BlockCache::new(1 << 20)); // 4GB block cache,
+
+        let (manifest, next_sst_id) = {
+            let mut next_sst_id = 1;
+            // check if file exists
+            let manifest_path = path.join(MANIFEST_FILE_PATH_SUFFIX);
+
+            if manifest_path.exists() {
+                let (manifest, records) = Manifest::recover(&manifest_path)?;
+                for record in records {
+                    match record {
+                        ManifestRecord::Flush(id) => {
+                            let sst_path = Self::path_of_sst_static(path, id);
+                            if !sst_path.exists() {
+                                return Err(anyhow!(
+                                    "sst file {:?} does not exist for manifest record",
+                                    sst_path
+                                ));
+                            }
+
+                            if compaction_controller.flush_to_l0() {
+                                state.l0_sstables.insert(0, id);
+                            } else {
+                                state.levels.insert(0, (id, vec![id]));
+                            }
+
+                            let sst = Arc::new(SsTable::open(
+                                id,
+                                Some(block_cache.clone()),
+                                FileObject::open(&sst_path)?,
+                            )?);
+
+                            state.sstables.insert(id, sst);
+
+                            next_sst_id = next_sst_id.max(id + 1);
+                        }
+                        ManifestRecord::Compaction(task, output) => {
+                            let mut ssts = Vec::new();
+                            for id in &output {
+                                let sst_path = Self::path_of_sst_static(path, *id);
+                                if !sst_path.exists() {
+                                    return Err(anyhow!(
+                                        "sst file {:?} does not exist for manifest record",
+                                        sst_path
+                                    ));
+                                }
+
+                                ssts.push(Arc::new(SsTable::open(
+                                    *id,
+                                    Some(block_cache.clone()),
+                                    FileObject::open(&sst_path)?,
+                                )?));
+                            }
+
+                            for sst in ssts.iter() {
+                                state.sstables.insert(sst.sst_id(), sst.clone());
+                            }
+
+                            let (mut state, old_sst_ids) = compaction_controller
+                                .apply_compaction_result(&state, &task, &output);
+
+                            {
+                                for sst_id in &old_sst_ids {
+                                    state.sstables.remove(sst_id);
+                                }
+                            }
+
+                            for sst_id in old_sst_ids {
+                                let path = Self::path_of_sst_static(path, sst_id);
+                                if path.exists() {
+                                    std::fs::remove_file(path)?;
+                                }
+                            }
+
+                            next_sst_id = next_sst_id.max(
+                                ssts.iter()
+                                    .map(|sst| sst.sst_id())
+                                    .max()
+                                    .map(|id| id + 1)
+                                    .unwrap_or(0),
+                            );
+                        }
+                        _ => unimplemented!(),
+                    }
+                }
+                (Some(manifest), next_sst_id)
+            } else {
+                (Some(Manifest::create(&manifest_path)?), next_sst_id)
+            }
+        };
+
+        state.memtable = Arc::new(MemTable::create(next_sst_id));
+
         let storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
             state_lock: Mutex::new(()),
             path: path.to_path_buf(),
-            block_cache: Arc::new(BlockCache::new(1024)),
-            next_sst_id: AtomicUsize::new(1),
+            block_cache,
+            next_sst_id: AtomicUsize::new(next_sst_id + 1),
             compaction_controller,
-            manifest: None,
+            manifest,
             options: options.into(),
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
+
+        storage.sync_dir()?;
 
         Ok(storage)
     }
@@ -456,11 +573,24 @@ impl LsmStorageInner {
     }
 
     pub(super) fn sync_dir(&self) -> Result<()> {
-        unimplemented!()
+        let state_lock_observer = self.state_lock.lock();
+        self.sync_dir_with_state_lock_observer(&state_lock_observer)
+    }
+
+    pub(crate) fn sync_dir_with_state_lock_observer(
+        &self,
+        _state_lock_observer: &MutexGuard<'_, ()>,
+    ) -> Result<()> {
+        File::open(&self.path)?.sync_all()?;
+        Ok(())
     }
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+        if self.state.read().memtable.is_empty() {
+            return Ok(());
+        }
+
         let new_memtable = {
             let id = self.next_sst_id();
             Arc::new(MemTable::create(id))
@@ -479,7 +609,6 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        let _state_lock = self.state_lock.lock();
         let imm_memtable = {
             let guard = self.state.read();
             let state = guard.as_ref().clone();
@@ -503,6 +632,18 @@ impl LsmStorageInner {
             Some(self.block_cache.clone()),
             self.path_of_sst(imm_memtable.id()),
         )?;
+
+        {
+            if let Some(Err(e)) = self.manifest.as_ref().map(|manifest| {
+                let state_lock = self.state_lock.lock();
+                manifest.add_record(&state_lock, ManifestRecord::Flush(imm_memtable.id()))?;
+                self.sync_dir_with_state_lock_observer(&state_lock)
+            }) {
+                // clean up the sst file if the manifest record fails
+                let _ = fs::remove_file(self.path_of_sst(imm_memtable.id()));
+                return Err(e);
+            }
+        }
 
         {
             let mut guard = self.state.write();
