@@ -16,12 +16,11 @@ pub struct Wal {
 
 impl Wal {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        println!("Creating wal file at {:?}", path.as_ref());
+        //println!("Creating wal file at {:?}", path.as_ref());
 
         let file = Arc::new(Mutex::new(BufWriter::new(
             OpenOptions::new()
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .write(true)
                 .read(true)
                 .open(path)?,
@@ -34,7 +33,7 @@ impl Wal {
         assert!(path.as_ref().exists(), "wal file not found");
         assert!(path.as_ref().is_file(), "wal file is not a file");
 
-        println!("Recovering wal file at {:?}", path.as_ref());
+        // println!("Recovering wal file at {:?}", path.as_ref());
 
         let mut file = OpenOptions::new().read(true).append(true).open(path)?;
         let mut buf = Vec::new();
@@ -73,7 +72,7 @@ impl Wal {
             skiplist.insert(key, value);
         }
 
-        println!("Recovered {} entries from wal", skiplist.len());
+        // println!("Recovered {} entries from wal", skiplist.len());
 
         Ok(Self {
             file: Arc::new(Mutex::new(BufWriter::new(file))),

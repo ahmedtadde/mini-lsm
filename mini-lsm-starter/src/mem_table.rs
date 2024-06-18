@@ -48,7 +48,7 @@ impl MemTable {
 
     /// Create a new mem-table with WAL
     pub fn create_with_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
-        println!("Creating MemTable with id {} and wal file", id,);
+        //println!("Creating MemTable with id {} and wal file", id,);
         let wal = Wal::create(path)?;
         Ok(MemTable {
             map: Arc::new(SkipMap::new()),
@@ -60,7 +60,7 @@ impl MemTable {
 
     /// Create a memtable from WAL
     pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
-        println!("Recovering MemTable {} from wal", id);
+        // println!("Recovering MemTable {} from wal", id);
         let map = Arc::new(SkipMap::new());
         let wal = Wal::recover(path, &map)?;
         Ok(MemTable {
@@ -108,10 +108,6 @@ impl MemTable {
         if let Some(ref wal) = self.wal {
             wal.put(key, value)?;
             wal.sync()?;
-            println!(
-                "Memtable::put(key: {:?}, value: {:?}) sync successful",
-                key, value
-            );
         }
 
         self.approximate_size.fetch_add(
@@ -124,7 +120,7 @@ impl MemTable {
     pub fn sync_wal(&self) -> Result<()> {
         if let Some(ref wal) = self.wal {
             wal.sync()?;
-            println!("Memtable::sync_wal sync successful");
+            //println!("Memtable::sync_wal sync successful");
         }
         Ok(())
     }

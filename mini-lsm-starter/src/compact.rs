@@ -354,7 +354,7 @@ impl LsmStorageInner {
 
         drop(reader);
 
-        let _sstables_to_cleanup_from_fs = {
+        let sstables_to_cleanup_from_fs = {
             let new_sstables = self.compact(&task)?;
             let state_lock = self.state_lock.lock();
             if let Some(manifest) = self.manifest.as_ref() {
@@ -406,9 +406,9 @@ impl LsmStorageInner {
             old_sst_ids
         };
 
-        // for sst in sstables_to_cleanup_from_fs {
-        //     std::fs::remove_file(self.path_of_sst(sst))?;
-        // }
+        for sst in sstables_to_cleanup_from_fs {
+            std::fs::remove_file(self.path_of_sst(sst))?;
+        }
 
         Ok(())
     }
@@ -459,12 +459,12 @@ impl LsmStorageInner {
 
             drop(writer);
 
-            // for sst_id in old_sst_ids {
-            //     let path = self.path_of_sst(sst_id);
-            //     if path.exists() {
-            //         std::fs::remove_file(path)?;
-            //     }
-            // }
+            for sst_id in old_sst_ids {
+                let path = self.path_of_sst(sst_id);
+                if path.exists() {
+                    std::fs::remove_file(path)?;
+                }
+            }
         };
 
         Ok(())
@@ -496,13 +496,13 @@ impl LsmStorageInner {
     }
 
     fn trigger_flush(&self) -> Result<()> {
-        let mentables_count = {
+        let memtables_count = {
             let guard = self.state.read();
             let state = guard.as_ref();
-            state.imm_memtables.len() + 1
+            state.imm_memtables.len()
         };
 
-        if mentables_count >= self.options.num_memtable_limit {
+        if memtables_count >= self.options.num_memtable_limit {
             self.force_flush_next_imm_memtable()?;
         }
         Ok(())

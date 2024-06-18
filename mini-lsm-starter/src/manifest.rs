@@ -36,7 +36,7 @@ impl Manifest {
             }
         };
 
-        println!("Creating manifest file at {:?}", path);
+        //println!("Creating manifest file at {:?}", path);
 
         let file = Arc::new(Mutex::new(
             OpenOptions::new()
