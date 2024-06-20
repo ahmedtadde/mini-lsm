@@ -1,7 +1,8 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use anyhow::Result;
-use bytes::{BufMut, Bytes, BytesMut};
+use anyhow::{anyhow, Result};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::mem::size_of;
 
 /// Implements a bloom filter
 pub struct Bloom {
@@ -46,9 +47,25 @@ impl<T: AsMut<[u8]>> BitSliceMut for T {
 
 impl Bloom {
     /// Decode a bloom filter
-    pub fn decode(buf: &[u8]) -> Result<Self> {
-        let filter = &buf[..buf.len() - 1];
-        let k = buf[buf.len() - 1];
+    pub fn decode(buffer: &[u8]) -> Result<Self> {
+        const U32_SIZE: usize = size_of::<u32>();
+        if buffer.len() < U32_SIZE {
+            return Err(anyhow!("bloom filter too short"));
+        }
+
+        // last 4 bytes should be the checksum... so, extract it and check it
+        let stored_checksum = (&buffer[buffer.len() - U32_SIZE..]).get_u32();
+        let computed_checksum = crc32fast::hash(&buffer[..buffer.len() - U32_SIZE]);
+        if stored_checksum != computed_checksum {
+            return Err(anyhow!(
+                "Checksum mismatch for bloom; stored {} vs computed {} ",
+                stored_checksum,
+                computed_checksum
+            ));
+        }
+        let bloom_bytes = &buffer[..buffer.len() - U32_SIZE];
+        let filter = &bloom_bytes[..bloom_bytes.len() - 1];
+        let k = bloom_bytes[bloom_bytes.len() - 1];
         Ok(Self {
             filter: filter.to_vec().into(),
             k,
@@ -57,8 +74,10 @@ impl Bloom {
 
     /// Encode a bloom filter
     pub fn encode(&self, buf: &mut Vec<u8>) {
+        let offset = buf.len();
         buf.extend(&self.filter);
         buf.put_u8(self.k);
+        buf.put_u32(crc32fast::hash(&buf[offset..]));
     }
 
     /// Get bloom filter bits per key from entries count and FPR

@@ -90,7 +90,9 @@ impl SsTableBuilder {
             last_key: iter.last_key().unwrap_or_default().into_key_bytes(),
         };
         self.meta.push(block_meta);
-        self.data.extend_from_slice(&block.encode());
+        let encoded_block = block.encode();
+        self.data.extend_from_slice(&encoded_block);
+        self.data.put_u32(crc32fast::hash(&encoded_block));
     }
 
     /// Get the estimated size of the SSTable.

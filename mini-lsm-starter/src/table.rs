@@ -21,6 +21,8 @@ use crate::lsm_storage::BlockCache;
 
 use self::bloom::Bloom;
 
+const U32_SIZE: usize = size_of::<u32>();
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
     /// Offset of this data block.
@@ -40,20 +42,45 @@ impl BlockMeta {
         #[allow(clippy::ptr_arg)] // remove this allow after you finish
         buf: &mut Vec<u8>,
     ) {
+        let offset = buf.len();
+        let blocks_count = block_meta.len();
+        if blocks_count > u32::MAX as usize {
+            panic!("blocks count too large");
+        }
+        buf.put_u32_ne(blocks_count as u32);
         block_meta.iter().for_each(|meta| {
             buf.put_u16_ne(meta.first_key.len() as u16);
             buf.extend_from_slice(meta.first_key.raw_ref());
             buf.put_u16_ne(meta.last_key.len() as u16);
             buf.extend_from_slice(meta.last_key.raw_ref());
             buf.put_u32_ne(meta.offset.try_into().unwrap());
-        })
+        });
+
+        let checksum = crc32fast::hash(&buf[offset..]);
+        buf.put_u32_ne(checksum)
     }
 
     /// Decode block meta from a buffer.
     pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
         let mut block_meta = Vec::new();
+        {
+            if buf.remaining() < 2 * U32_SIZE {
+                return block_meta;
+            }
+
+            // last 4 bytes should be the checksum... so, extract it and check it
+            let stored_checksum = buf.chunk()[buf.remaining() - U32_SIZE..]
+                .as_ref()
+                .get_u32_ne();
+            let computed_checksum = crc32fast::hash(&buf.chunk()[..buf.remaining() - U32_SIZE]);
+            if stored_checksum != computed_checksum {
+                return block_meta;
+            }
+        }
+
         let mut buf = buf;
-        while buf.has_remaining() {
+        let blocks_count = buf.get_u32_ne() as usize;
+        while buf.has_remaining() && block_meta.len() < blocks_count {
             let first_key_len = buf.get_u16_ne() as usize;
             let first_key = buf.copy_to_bytes(first_key_len);
             let last_key_len = buf.get_u16_ne() as usize;
@@ -142,7 +169,6 @@ impl SsTable {
             bytes
         };
 
-        const U32_SIZE: usize = size_of::<u32>();
         let bloom_offset = (&bytes[bytes.len() - U32_SIZE..]).get_u32() as usize;
         let bloom = &bytes[bloom_offset..bytes.len() - U32_SIZE];
         let bloom = Bloom::decode(bloom)?;
@@ -152,6 +178,10 @@ impl SsTable {
 
         let block_meta = &bytes[block_meta_offset..bytes.len() - U32_SIZE];
         let block_meta = BlockMeta::decode_block_meta(block_meta);
+        if block_meta.is_empty() {
+            return Err(anyhow!("block meta is empty"));
+        }
+
         let first_key = block_meta
             .first()
             .map(|meta| meta.first_key.clone())
@@ -214,7 +244,19 @@ impl SsTable {
         let mut buffer = vec![0; length];
         file.read_exact_at(&mut buffer, start as u64)?;
 
-        Ok(Arc::new(Block::decode(&buffer)))
+        // last 4 bytes should be the checksum... so, extract it and check it
+        let stored_checksum = (&buffer[buffer.len() - U32_SIZE..]).get_u32();
+        let computed_checksum = crc32fast::hash(&buffer[..buffer.len() - U32_SIZE]);
+        if stored_checksum != computed_checksum {
+            return Err(anyhow!(
+                "Checksum mismatch for block {}; stored {} vs computed {} ",
+                block_idx,
+                stored_checksum,
+                computed_checksum
+            ));
+        }
+
+        Ok(Arc::new(Block::decode(&buffer[..buffer.len() - U32_SIZE])))
     }
 
     /// Read a block from disk, with block cache. (Day 4)

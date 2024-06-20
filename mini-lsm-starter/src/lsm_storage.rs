@@ -1,6 +1,6 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -540,23 +540,43 @@ impl LsmStorageInner {
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
-    }
-
-    /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        assert!(!key.is_empty(), "key is empty");
-        assert!(key.len() <= 1 << 20, "key is too large");
-        assert!(!value.is_empty(), "value is empty");
-        assert!(value.len() <= 1 << 20, "value is too large");
-
+    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         let memtable_capacity = {
             let guard = self.state.read();
             let writer = guard.as_ref().memtable.clone();
 
-            // write the key-value pair to the memtable
-            writer.put(key, value)?;
+            let mut deleted_keys = HashSet::new();
+            for record in batch {
+                match record {
+                    WriteBatchRecord::Put(key, value) => {
+                        assert!(!key.as_ref().is_empty(), "key is empty");
+                        assert!(key.as_ref().len() <= 1 << 20, "key is too large");
+                        assert!(!value.as_ref().is_empty(), "value is empty");
+                        assert!(value.as_ref().len() <= 1 << 20, "value is too large");
+                        assert!(
+                            !deleted_keys.contains(key.as_ref()),
+                            "cant perform put on a deleted key"
+                        );
+                    }
+                    WriteBatchRecord::Del(key) => {
+                        assert!(!key.as_ref().is_empty(), "key is empty");
+                        assert!(key.as_ref().len() <= 1 << 20, "key is too large");
+                        deleted_keys.insert(key.as_ref());
+                    }
+                }
+            }
+
+            for record in batch {
+                match record {
+                    WriteBatchRecord::Put(key, value) => {
+                        writer.put(key.as_ref(), value.as_ref())?;
+                    }
+                    WriteBatchRecord::Del(key) => {
+                        writer.put(key.as_ref(), &[])?;
+                    }
+                }
+            }
+
             writer.approximate_size()
         };
 
@@ -570,20 +590,14 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    /// Put a key-value pair into the storage by writing into the current memtable.
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.write_batch(&[WriteBatchRecord::Put(key, value)])
+    }
+
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        let guard = self.state.read();
-        let writer = guard.as_ref().memtable.clone();
-        writer.put(key, &[])?;
-        if writer.approximate_size() >= self.options.target_sst_size {
-            let state_lock_observer = self.state_lock.lock();
-            if writer.approximate_size() >= self.options.target_sst_size {
-                drop(guard);
-                self.force_freeze_memtable(&state_lock_observer)?;
-            }
-        }
-
-        Ok(())
+        self.write_batch(&[WriteBatchRecord::Del(key)])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
