@@ -43,12 +43,12 @@ impl SstConcatIterator {
         let mut right = sstables.len();
         while left < right {
             let mid = left + (right - left) / 2;
-            if sstables[mid].first_key().raw_ref() <= key.raw_ref()
-                && key.raw_ref() <= sstables[mid].last_key().raw_ref()
+            if sstables[mid].first_key().key_ref() <= key.key_ref()
+                && key.key_ref() <= sstables[mid].last_key().key_ref()
             {
                 next_sst_idx = mid;
                 break;
-            } else if sstables[mid].first_key().raw_ref() > key.raw_ref() {
+            } else if sstables[mid].first_key().key_ref() > key.key_ref() {
                 right = mid;
             } else {
                 left = mid + 1;

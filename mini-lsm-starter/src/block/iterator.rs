@@ -44,16 +44,15 @@ impl BlockIterator {
         if self.block.offsets.len() <= idx {
             ((0, 0), KeyVec::new())
         } else {
-            let data = self.block.offsets[idx] as usize;
-            let mut data = &self.block.data[data..];
+            let mut data = &self.block.data[(self.block.offsets[idx] as usize)..];
             let prefix_len = data.get_u16() as usize;
             let key_len = data.get_u16() as usize;
             let key = {
-                let mut key = vec![0; key_len + prefix_len];
+                let mut key = vec![0; prefix_len + key_len];
                 if let Some(prefix) = self
                     .prefix
                     .as_ref()
-                    .map(|bytes| &bytes.raw_ref()[..prefix_len])
+                    .map(|bytes| &bytes.key_ref()[..prefix_len])
                 {
                     key[0..prefix_len].copy_from_slice(prefix);
                 }
@@ -62,8 +61,12 @@ impl BlockIterator {
                 key
             };
 
+            let timestamp = data.get_u64();
             let val_len = data.get_u16() as usize;
-            ((key_len, val_len), KeyVec::from_vec(key))
+            (
+                (key_len + size_of::<u64>(), val_len),
+                KeyVec::from_vec_with_ts(key, timestamp),
+            )
         }
     }
 

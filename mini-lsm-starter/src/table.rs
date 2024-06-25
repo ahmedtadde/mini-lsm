@@ -49,10 +49,12 @@ impl BlockMeta {
         }
         buf.put_u32_ne(blocks_count as u32);
         block_meta.iter().for_each(|meta| {
-            buf.put_u16_ne(meta.first_key.len() as u16);
-            buf.extend_from_slice(meta.first_key.raw_ref());
-            buf.put_u16_ne(meta.last_key.len() as u16);
-            buf.extend_from_slice(meta.last_key.raw_ref());
+            buf.put_u16_ne(meta.first_key.key_len() as u16);
+            buf.extend_from_slice(meta.first_key.key_ref());
+            buf.put_u64_ne(meta.first_key.ts());
+            buf.put_u16_ne(meta.last_key.key_len() as u16);
+            buf.extend_from_slice(meta.last_key.key_ref());
+            buf.put_u64_ne(meta.last_key.ts());
             buf.put_u32_ne(meta.offset.try_into().unwrap());
         });
 
@@ -83,13 +85,15 @@ impl BlockMeta {
         while buf.has_remaining() && block_meta.len() < blocks_count {
             let first_key_len = buf.get_u16_ne() as usize;
             let first_key = buf.copy_to_bytes(first_key_len);
+            let first_key_ts = buf.get_u64_ne();
             let last_key_len = buf.get_u16_ne() as usize;
             let last_key = buf.copy_to_bytes(last_key_len);
+            let last_key_ts = buf.get_u64_ne();
             let offset = buf.get_u32_ne() as usize;
             block_meta.push(BlockMeta {
                 offset,
-                first_key: KeyBytes::from_bytes(first_key),
-                last_key: KeyBytes::from_bytes(last_key),
+                first_key: KeyBytes::from_bytes_with_ts(first_key, first_key_ts),
+                last_key: KeyBytes::from_bytes_with_ts(last_key, last_key_ts),
             });
         }
 
@@ -307,28 +311,28 @@ impl SsTable {
     }
 
     pub fn key_is_within_range(&self, key: &KeySlice) -> bool {
-        self.first_key.raw_ref() <= key.raw_ref() && key.raw_ref() <= self.last_key.raw_ref()
+        self.first_key.key_ref() <= key.key_ref() && key.key_ref() <= self.last_key.key_ref()
     }
 
     pub fn may_contain_key(&self, key: &KeySlice) -> bool {
         if let Some(bloom) = &self.bloom {
-            let hash = farmhash::fingerprint32(key.raw_ref());
+            let hash = farmhash::fingerprint32(key.key_ref());
             bloom.may_contain(hash)
         } else {
-            self.first_key.raw_ref() <= key.raw_ref() && key.raw_ref() <= self.last_key.raw_ref()
+            self.first_key.key_ref() <= key.key_ref() && key.key_ref() <= self.last_key.key_ref()
         }
     }
 
     pub fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
         match upper {
-            Bound::Included(upper) if upper < self.first_key.raw_ref() => return false,
-            Bound::Excluded(upper) if upper <= self.first_key.raw_ref() => return false,
+            Bound::Included(upper) if upper < self.first_key.key_ref() => return false,
+            Bound::Excluded(upper) if upper <= self.first_key.key_ref() => return false,
             _ => {}
         };
 
         match lower {
-            Bound::Included(lower) if self.last_key.raw_ref() < lower => return false,
-            Bound::Excluded(lower) if self.last_key.raw_ref() <= lower => return false,
+            Bound::Included(lower) if self.last_key.key_ref() < lower => return false,
+            Bound::Excluded(lower) if self.last_key.key_ref() <= lower => return false,
             _ => {}
         };
 

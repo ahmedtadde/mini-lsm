@@ -3,6 +3,7 @@
 
 mod builder;
 mod iterator;
+use std::mem::size_of;
 
 pub use builder::BlockBuilder;
 use bytes::{Buf, Bytes, BytesMut};
@@ -21,7 +22,7 @@ impl Block {
         let mut buf = &self.data[..];
         buf.get_u16();
         let key_len = buf.get_u16();
-        let key = &buf[..key_len as usize];
+        let key = &buf[..key_len as usize + size_of::<u64>()];
         key.to_vec()
     }
     /// Encode the internal data to the data layout illustrated in the tutorial

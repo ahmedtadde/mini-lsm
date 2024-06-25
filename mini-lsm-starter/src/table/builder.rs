@@ -10,7 +10,7 @@ use bytes::{BufMut, Bytes};
 
 use super::{BlockMeta, FileObject, SsTable};
 use crate::block::BlockIterator;
-use crate::key::KeyBytes;
+use crate::key::{KeyBytes, TS_DEFAULT};
 use crate::table::bloom::Bloom;
 use crate::{block::BlockBuilder, key::KeySlice, lsm_storage::BlockCache};
 
@@ -60,16 +60,16 @@ impl SsTableBuilder {
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         if self.first_key.is_empty() {
-            self.first_key = key.raw_ref().to_vec();
+            self.first_key = key.key_ref().to_vec();
         }
 
-        let prefix_len = mismatch(&self.first_key, key.raw_ref());
+        let prefix_len = mismatch(&self.first_key, key.key_ref());
         let ok = self.builder.add_with_prefix(key, prefix_len, value);
         if !ok {
             self.split_block();
             let _ = self.builder.add_with_prefix(key, prefix_len, value);
         }
-        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
+        self.key_hashes.push(farmhash::fingerprint32(key.key_ref()));
     }
 
     fn split_block(&mut self) {
@@ -79,9 +79,10 @@ impl SsTableBuilder {
 
         let iter = BlockIterator::new_with_prefix(
             block.clone(),
-            Some(KeyBytes::from_bytes(Bytes::copy_from_slice(
-                &self.first_key,
-            ))),
+            Some(KeyBytes::from_bytes_with_ts(
+                Bytes::copy_from_slice(&self.first_key),
+                TS_DEFAULT,
+            )),
         );
 
         let block_meta = BlockMeta {

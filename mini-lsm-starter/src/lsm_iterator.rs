@@ -59,8 +59,8 @@ impl LsmIterator {
 
     fn is_before_upper_bound(&self) -> bool {
         self.upper_bound.as_ref().map_or(true, |bound| match bound {
-            Bound::Included(key) => self.inner.key().raw_ref() <= key.as_ref(),
-            Bound::Excluded(key) => self.inner.key().raw_ref() < key.as_ref(),
+            Bound::Included(key) => self.inner.key().key_ref() <= key.as_ref(),
+            Bound::Excluded(key) => self.inner.key().key_ref() < key.as_ref(),
             Bound::Unbounded => true,
         })
     }
@@ -74,7 +74,7 @@ impl StorageIterator for LsmIterator {
     }
 
     fn key(&self) -> &[u8] {
-        self.inner.key().raw_ref()
+        self.inner.key().key_ref()
     }
 
     fn value(&self) -> &[u8] {
