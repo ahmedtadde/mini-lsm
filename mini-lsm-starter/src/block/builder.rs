@@ -12,6 +12,7 @@ pub struct BlockBuilder {
     block_size: usize,
     /// The first key in the block
     first_key: KeyVec,
+    last_key: KeyVec,
     /// The common prefix
     prefix: Option<KeyVec>,
 }
@@ -24,6 +25,7 @@ impl BlockBuilder {
             data: vec![],
             block_size,
             first_key: KeyVec::new(),
+            last_key: KeyVec::new(),
             prefix: None,
         }
     }
@@ -78,6 +80,8 @@ impl BlockBuilder {
             self.first_key = KeyVec::from_vec_with_ts(key.key_ref().to_vec(), key.ts());
         }
 
+        self.last_key = KeyVec::from_vec_with_ts(key.key_ref().to_vec(), key.ts());
+
         true
     }
 
@@ -90,6 +94,10 @@ impl BlockBuilder {
     /// Check if there is no key-value pair in the block.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    pub fn last_key(&self) -> KeyVec {
+        self.last_key.clone()
     }
 
     /// Finalize the block.

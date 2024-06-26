@@ -14,11 +14,18 @@ impl Watermark {
         }
     }
 
-    pub fn add_reader(&mut self, ts: u64) {}
+    pub fn add_reader(&mut self, ts: u64) {
+        self.readers.entry(ts).and_modify(|e| *e += 1).or_insert(1);
+    }
 
-    pub fn remove_reader(&mut self, ts: u64) {}
+    pub fn remove_reader(&mut self, ts: u64) {
+        self.readers.entry(ts).and_modify(|e| *e -= 1);
+        if self.readers[&ts] == 0 {
+            self.readers.remove(&ts);
+        }
+    }
 
     pub fn watermark(&self) -> Option<u64> {
-        Some(0)
+        self.readers.keys().next().copied()
     }
 }

@@ -20,7 +20,7 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::{KeySlice, TS_DEFAULT, TS_RANGE_BEGIN};
+use crate::key::{KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord, MANIFEST_FILE_PATH_SUFFIX};
 use crate::mem_table::MemTable;
@@ -430,7 +430,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: options.into(),
-            mvcc: None,
+            mvcc: Some(LsmMvccInner::new(TS_DEFAULT)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
 
@@ -457,83 +457,82 @@ impl LsmStorageInner {
             Arc::clone(&guard)
         };
 
-        {
-            if let Some(value) = reader.memtable.get(key) {
-                if value.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(value));
-            }
+        let memtables_merge_iter = {
+            let mut iters = Vec::with_capacity(1 + reader.imm_memtables.len());
+            iters.push(Box::new(reader.memtable.scan(
+                Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN)),
+                Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
+            )));
 
             for imm_memtable in reader.imm_memtables.iter() {
-                if let Some(value) = imm_memtable.get(key) {
-                    if value.is_empty() {
-                        return Ok(None);
-                    }
-                    return Ok(Some(value));
-                }
+                iters.push(Box::new(imm_memtable.scan(
+                    Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN)),
+                    Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
+                )));
             }
-        }
+            MergeIterator::create(iters)
+        };
 
-        {
-            let sstables = {
-                let l0_sstables_iter = MergeIterator::create(
-                    reader
-                        .l0_sstables
-                        .iter()
-                        .filter_map(|id| {
-                            let sst = reader.sstables.get(id).unwrap();
-                            sst.bloom.as_ref().and_then(|bloom| {
-                                if !bloom.may_contain(farmhash::fingerprint32(key)) {
-                                    None
-                                } else {
-                                    SsTableIterator::create_and_seek_to_key(
-                                        sst.clone(),
-                                        KeySlice::from_slice(key, TS_RANGE_BEGIN),
-                                    )
-                                    .ok()
-                                }
-                            })
+        let sstables = {
+            let l0_sstables_merge_iter = MergeIterator::create(
+                reader
+                    .l0_sstables
+                    .iter()
+                    .filter_map(|id| {
+                        let sst = reader.sstables.get(id).unwrap();
+                        sst.bloom.as_ref().and_then(|bloom| {
+                            if !bloom.may_contain(farmhash::fingerprint32(key)) {
+                                None
+                            } else {
+                                SsTableIterator::create_and_seek_to_key(
+                                    sst.clone(),
+                                    KeySlice::from_slice(key, TS_RANGE_BEGIN),
+                                )
+                                .ok()
+                            }
                         })
-                        .map(Box::new)
-                        .collect::<Vec<Box<SsTableIterator>>>(),
-                );
+                    })
+                    .map(Box::new)
+                    .collect::<Vec<Box<SsTableIterator>>>(),
+            );
 
-                let other_sstables_iter = MergeIterator::create(
-                    reader
-                        .levels
-                        .iter()
-                        .filter_map(|(_, sstables)| {
-                            let parsed_sstables = sstables
-                                .iter()
-                                .filter_map(|id| reader.sstables.get(id))
-                                .filter_map(|sst| {
-                                    sst.bloom.as_ref().and_then(|bloom| {
-                                        if !bloom.may_contain(farmhash::fingerprint32(key)) {
-                                            None
-                                        } else {
-                                            Some(sst.clone())
-                                        }
-                                    })
-                                });
+            let mentables_and_l0_sstables_merge_iter =
+                TwoMergeIterator::create(memtables_merge_iter, l0_sstables_merge_iter)?;
 
-                            SstConcatIterator::create_and_seek_to_key(
-                                parsed_sstables.collect(),
-                                KeySlice::from_slice(key, TS_RANGE_BEGIN),
-                            )
-                            .ok()
-                        })
-                        .map(Box::new)
-                        .collect::<Vec<Box<SstConcatIterator>>>(),
-                );
+            let other_sstables_iter = MergeIterator::create(
+                reader
+                    .levels
+                    .iter()
+                    .filter_map(|(_, sstables)| {
+                        let parsed_sstables = sstables
+                            .iter()
+                            .filter_map(|id| reader.sstables.get(id))
+                            .filter_map(|sst| {
+                                sst.bloom.as_ref().and_then(|bloom| {
+                                    if !bloom.may_contain(farmhash::fingerprint32(key)) {
+                                        None
+                                    } else {
+                                        Some(sst.clone())
+                                    }
+                                })
+                            });
 
-                TwoMergeIterator::create(l0_sstables_iter, other_sstables_iter)
-            }?;
+                        SstConcatIterator::create_and_seek_to_key(
+                            parsed_sstables.collect(),
+                            KeySlice::from_slice(key, TS_RANGE_BEGIN),
+                        )
+                        .ok()
+                    })
+                    .map(Box::new)
+                    .collect::<Vec<Box<SstConcatIterator>>>(),
+            );
 
-            let iter = FusedIterator::new(sstables);
-            if iter.is_valid() && iter.key().key_ref() == key && !iter.value().is_empty() {
-                return Ok(Some(Bytes::copy_from_slice(iter.value())));
-            }
+            TwoMergeIterator::create(mentables_and_l0_sstables_merge_iter, other_sstables_iter)
+        }?;
+
+        let iter = FusedIterator::new(sstables);
+        if iter.is_valid() && iter.key().key_ref() == key && !iter.value().is_empty() {
+            return Ok(Some(Bytes::copy_from_slice(iter.value())));
         }
 
         Ok(None)
@@ -544,6 +543,20 @@ impl LsmStorageInner {
         let memtable_capacity = {
             let guard = self.state.read();
             let writer = guard.as_ref().memtable.clone();
+            let mvcc_handle = self.mvcc.as_ref();
+            let mvcc_handle_lock = mvcc_handle.map(|mvcc_handle| mvcc_handle.write_lock.lock());
+            // println!(
+            //     "iambatman/write_batch:memtable_capacity:handles are present? {:?} && {:?}",
+            //     mvcc_handle.is_some(),
+            //     mvcc_handle_lock.is_some()
+            // );
+            let ts = {
+                if mvcc_handle.is_none() || mvcc_handle_lock.is_none() {
+                    TS_DEFAULT
+                } else {
+                    mvcc_handle.map_or(TS_DEFAULT, |mvcc_handle| mvcc_handle.latest_commit_ts() + 1)
+                }
+            };
 
             let mut deleted_keys = HashSet::new();
             for record in batch {
@@ -569,11 +582,31 @@ impl LsmStorageInner {
             for record in batch {
                 match record {
                     WriteBatchRecord::Put(key, value) => {
-                        writer.put(key.as_ref(), value.as_ref())?;
+                        // println!(
+                        //     "iambatman/write_batch:memtable_capacity:putting key: ({:?}, {:?})",
+                        //     key.as_ref(),
+                        //     ts
+                        // );
+                        writer.put(KeySlice::from_slice(key.as_ref(), ts), value.as_ref())?;
                     }
                     WriteBatchRecord::Del(key) => {
-                        writer.put(key.as_ref(), &[])?;
+                        // println!(
+                        //     "iambatman/write_batch:memtable_capacity:deleting key: ({:?}, {:?})",
+                        //     key.as_ref(),
+                        //     ts
+                        // );
+                        writer.put(KeySlice::from_slice(key.as_ref(), ts), &[])?;
                     }
+                }
+            }
+
+            if let Some(handle) = mvcc_handle {
+                if mvcc_handle_lock.is_some() {
+                    handle.update_commit_ts(ts);
+                    // println!(
+                    //     "iambatman/write_batch:memtable_capacity:updated commit ts to {:?}",
+                    //     ts
+                    // );
                 }
             }
 
@@ -760,9 +793,15 @@ impl LsmStorageInner {
             Arc::clone(&guard)
         };
         let mut iters = Vec::with_capacity(1 + reader.imm_memtables.len());
-        iters.push(Box::new(reader.memtable.scan(lower, upper)));
+        iters.push(Box::new(reader.memtable.scan(
+            lower.map(|k| KeySlice::from_slice(k, TS_RANGE_BEGIN)),
+            upper.map(|k| KeySlice::from_slice(k, TS_RANGE_END)),
+        )));
         for imm_memtable in reader.imm_memtables.iter() {
-            iters.push(Box::new(imm_memtable.scan(lower, upper)));
+            iters.push(Box::new(imm_memtable.scan(
+                lower.map(|k| KeySlice::from_slice(k, TS_RANGE_BEGIN)),
+                upper.map(|k| KeySlice::from_slice(k, TS_RANGE_END)),
+            )));
         }
         let memtables_merge_iter = MergeIterator::create(iters);
 
@@ -792,11 +831,11 @@ impl LsmStorageInner {
                     Bound::Excluded(key) => {
                         let mut iter = SsTableIterator::create_and_seek_to_key(
                             sst.clone(),
-                            KeySlice::from_slice(key, TS_RANGE_BEGIN),
+                            KeySlice::from_slice(key, TS_RANGE_END),
                         )
                         .unwrap();
 
-                        if iter.is_valid() && iter.key() == KeySlice::from_slice(key, TS_DEFAULT) {
+                        if iter.is_valid() && iter.key().key_ref() == key {
                             iter.next().unwrap();
                         };
 
@@ -846,7 +885,7 @@ impl LsmStorageInner {
                     (Bound::Excluded(key), _) => {
                         let iter = SstConcatIterator::create_and_seek_to_key(
                             parsed_sstables,
-                            KeySlice::from_slice(key, TS_RANGE_BEGIN),
+                            KeySlice::from_slice(key, TS_RANGE_END),
                         );
 
                         if iter.is_err() {
@@ -855,7 +894,7 @@ impl LsmStorageInner {
 
                         let mut iter = iter.unwrap();
 
-                        if iter.is_valid() && iter.key() == KeySlice::from_slice(key, TS_DEFAULT) {
+                        if iter.is_valid() && iter.key().key_ref() == key {
                             _ = iter.next();
                         };
                         Some(iter)

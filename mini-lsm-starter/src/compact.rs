@@ -131,11 +131,30 @@ impl LsmStorageInner {
         &self,
         mut sstable_iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
     ) -> Result<Vec<Arc<SsTable>>> {
+        assert!(
+            self.options.target_sst_size > 0,
+            "target_sst_size must be greater than 0"
+        );
+        assert!(
+            self.options.block_size > 0,
+            "block_size must be greater than 0"
+        );
+        assert!(
+            self.options.target_sst_size >= self.options.block_size,
+            "target_sst_size must be greater than or equal to block_size"
+        );
+        // println!("iambatman/ssts_from_compact_iter: invoked");
         let mut new_sstables = Vec::new();
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
 
         while sstable_iter.is_valid() {
             let key = sstable_iter.key();
+            // println!(
+            //     "iambatman/ssts_from_compact_iter: iter key: {:?}, {:?}",
+            //     key.key_ref(),
+            //     key.ts()
+            // );
+
             let value = sstable_iter.value();
 
             if value.is_empty() {
@@ -143,19 +162,23 @@ impl LsmStorageInner {
                 continue;
             }
 
-            sst_builder.add(key, value);
+            let last_inserted_key = sst_builder.last_inserted_key();
+            // println!(
+            //     "iambatman/ssts_from_compact_iter: last inserted key: {:?}, {:?}",
+            //     last_inserted_key.key_ref(),
+            //     last_inserted_key.ts()
+            // );
 
-            // if compact_to_bottom_level {
-            //     if !value.is_empty() {
-            //         sst_builder.add(key, value);
-            //     }
-            // } else {
-            //     sst_builder.add(key, value);
-            // }
+            // println!(
+            //     "iambatman/ssts_from_compact_iter: estimated size {} vs target size {}",
+            //     sst_builder.estimated_size(),
+            //     self.options.target_sst_size
+            // );
 
-            // sstable_iter.next()?;
-
-            if sst_builder.estimated_size() >= self.options.target_sst_size {
+            if sst_builder.estimated_size() >= self.options.target_sst_size
+                && key.key_ref() != last_inserted_key.key_ref()
+            {
+                // println!("iambatman/ssts_from_compact_iter: provisoning new sstable with size",);
                 let builder = std::mem::replace(
                     &mut sst_builder,
                     SsTableBuilder::new(self.options.block_size),
@@ -169,6 +192,8 @@ impl LsmStorageInner {
 
                 new_sstables.push(Arc::new(sstable));
             }
+
+            sst_builder.add(key, value);
             sstable_iter.next()?;
         }
 
@@ -182,6 +207,10 @@ impl LsmStorageInner {
             new_sstables.push(Arc::new(sstable));
         }
 
+        // println!(
+        //     "iambatman/ssts_from_compact_iter: returning new sstables {:?}",
+        //     new_sstables.len()
+        // );
         Ok(new_sstables)
     }
 

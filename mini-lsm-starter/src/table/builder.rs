@@ -10,7 +10,7 @@ use bytes::{BufMut, Bytes};
 
 use super::{BlockMeta, FileObject, SsTable};
 use crate::block::BlockIterator;
-use crate::key::{KeyBytes, TS_DEFAULT};
+use crate::key::{KeyBytes, KeyVec, TS_DEFAULT};
 use crate::table::bloom::Bloom;
 use crate::{block::BlockBuilder, key::KeySlice, lsm_storage::BlockCache};
 
@@ -106,6 +106,10 @@ impl SsTableBuilder {
 
     pub fn is_empty(&self) -> bool {
         self.data.is_empty() && self.builder.is_empty()
+    }
+
+    pub fn last_inserted_key(&self) -> KeyVec {
+        self.builder.last_key()
     }
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
