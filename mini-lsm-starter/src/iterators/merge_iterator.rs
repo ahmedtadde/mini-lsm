@@ -48,6 +48,22 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
+        if iters.is_empty() {
+            return Self {
+                iters: BinaryHeap::new(),
+                current: None,
+            };
+        }
+
+        // check if all iters are invalid
+        if iters.iter().all(|x| !x.is_valid()) {
+            let mut iters = iters;
+            return Self {
+                iters: BinaryHeap::new(),
+                current: Some(HeapWrapper(0, iters.pop().unwrap())),
+            };
+        }
+
         let mut bheap =
             BinaryHeap::from_iter(iters.into_iter().enumerate().filter_map(|(i, iter)| {
                 if iter.is_valid() {
@@ -57,12 +73,10 @@ impl<I: StorageIterator> MergeIterator<I> {
                 }
             }));
 
-        if bheap.is_empty() {
-            return MergeIterator {
-                iters: bheap,
-                current: None,
-            };
-        }
+        assert!(
+            !bheap.is_empty(),
+            "All iterators should be valid at this point"
+        );
 
         let current = bheap.pop().unwrap();
         Self {

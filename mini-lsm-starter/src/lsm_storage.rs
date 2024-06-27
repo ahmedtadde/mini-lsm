@@ -803,7 +803,20 @@ impl LsmStorageInner {
                 upper.map(|k| KeySlice::from_slice(k, TS_RANGE_END)),
             )));
         }
+
+        // println!(
+        //     "iambatman/scan:memtables_iters: {:?} (imm_memtables count is {:?})...also memtable size is {:?} , number of active iterators are {:?} and first iter is valid {:?}",
+        //     iters.len(),
+        //     reader.imm_memtables.len(),
+        //     reader.memtable.approximate_size(),
+        //     iters.iter().map(|iter| iter.num_active_iterators()).collect::<Vec<_>>(),
+        //     iters.first().unwrap().is_valid()
+        // );
         let memtables_merge_iter = MergeIterator::create(iters);
+        // println!(
+        //     "iambatman/scan:memtables_merge_iter: number of active iterators are {:?}",
+        //     memtables_merge_iter.num_active_iterators()
+        // );
 
         let l0_sstables = reader
             .l0_sstables
@@ -847,10 +860,21 @@ impl LsmStorageInner {
             .map(Box::new)
             .collect::<Vec<Box<SsTableIterator>>>();
 
+        // println!("iambatman/scan:l0_sstables: {:?}", l0_sstables.len());
+
         let l0_sstables_merge_iter = MergeIterator::create(l0_sstables);
+        // println!(
+        //     "iambatman/scan:l0_sst merge_iter: number of active iterators are {:?}",
+        //     l0_sstables_merge_iter.num_active_iterators()
+        // );
 
         let mentables_and_l0_sstables_merge_iter =
             TwoMergeIterator::create(memtables_merge_iter, l0_sstables_merge_iter)?;
+
+        // println!(
+        //     "iambatman/scan:mentables_and_l0_sstables_merge_iter: number of active iterators are {:?}",
+        //     mentables_and_l0_sstables_merge_iter.num_active_iterators()
+        // );
 
         let other_sstables = reader
             .levels
@@ -906,8 +930,16 @@ impl LsmStorageInner {
             })
             .map(Box::new)
             .collect::<Vec<Box<SstConcatIterator>>>();
-
+        // println!(
+        //     "iambatman/scan:other_sstables count {:?} and valid count {:?}",
+        //     other_sstables.len(),
+        //     other_sstables.iter().filter(|iter| iter.is_valid()).count()
+        // );
         let other_tables_merge_iter = MergeIterator::create(other_sstables);
+        // println!(
+        //     "iambatman/scan:other_tables_merge_iter: number of active iterators are {:?}",
+        //     other_tables_merge_iter.num_active_iterators()
+        // );
 
         let merge_iter = TwoMergeIterator::create(
             mentables_and_l0_sstables_merge_iter,

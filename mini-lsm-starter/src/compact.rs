@@ -157,11 +157,6 @@ impl LsmStorageInner {
 
             let value = sstable_iter.value();
 
-            if value.is_empty() {
-                sstable_iter.next()?;
-                continue;
-            }
-
             let last_inserted_key = sst_builder.last_inserted_key();
             // println!(
             //     "iambatman/ssts_from_compact_iter: last inserted key: {:?}, {:?}",
