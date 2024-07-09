@@ -11,7 +11,7 @@ use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
 
 use crate::iterators::StorageIterator;
-use crate::key::{KeyBytes, KeySlice, TS_DEFAULT};
+use crate::key::{KeyBytes, KeySlice, TS_DEFAULT, TS_RANGE_END};
 use crate::table::SsTableBuilder;
 use crate::wal::Wal;
 
@@ -20,7 +20,7 @@ use crate::wal::Wal;
 /// An initial implementation of memtable is part of week 1, day 1. It will be incrementally implemented in other
 /// chapters of week 1 and week 2.
 pub struct MemTable {
-    map: Arc<SkipMap<KeyBytes, Bytes>>,
+    pub(crate) map: Arc<SkipMap<KeyBytes, Bytes>>,
     wal: Option<Wal>,
     id: usize,
     approximate_size: Arc<AtomicUsize>,
@@ -35,7 +35,7 @@ pub(crate) fn map_bound(bound: Bound<KeySlice>) -> Bound<KeyBytes> {
         )),
         Bound::Excluded(x) => Bound::Excluded(KeyBytes::from_bytes_with_ts(
             Bytes::copy_from_slice(x.key_ref()),
-            x.ts(),
+            TS_RANGE_END,
         )),
         Bound::Unbounded => Bound::Unbounded,
     }
@@ -118,7 +118,7 @@ impl MemTable {
 
         if let Some(ref wal) = self.wal {
             wal.put(&key, value)?;
-            wal.sync()?;
+            // wal.sync()?;
         }
 
         self.approximate_size.fetch_add(
@@ -159,10 +159,7 @@ impl MemTable {
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
     pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
         self.map.iter().for_each(|entry| {
-            builder.add(
-                KeySlice::from_slice(entry.key().key_ref(), entry.key().ts()),
-                entry.value(),
-            );
+            builder.add(entry.key().as_key_slice(), entry.value());
         });
 
         Ok(())

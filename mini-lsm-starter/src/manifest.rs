@@ -127,7 +127,7 @@ impl Manifest {
         writer.write_all((buf.len() as u32).to_ne_bytes().as_ref())?;
         writer.write_all(&buf)?;
         writer.write_all(crc32fast::hash(&buf).to_ne_bytes().as_ref())?;
-        writer.flush()?;
+        // writer.flush()?;
         writer.sync_all()?;
 
         Ok(())

@@ -10,7 +10,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 pub use builder::SsTableBuilder;
 use bytes::{Buf, BufMut};
 pub use iterator::SsTableIterator;
@@ -22,6 +22,7 @@ use crate::lsm_storage::BlockCache;
 use self::bloom::Bloom;
 
 const U32_SIZE: usize = size_of::<u32>();
+const U64_SIZE: usize = size_of::<u64>();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -37,11 +38,7 @@ impl BlockMeta {
     /// Encode block meta to a buffer.
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
-    pub fn encode_block_meta(
-        block_meta: &[BlockMeta],
-        #[allow(clippy::ptr_arg)] // remove this allow after you finish
-        buf: &mut Vec<u8>,
-    ) {
+    pub fn encode_block_meta(block_meta: &[BlockMeta], max_ts: u64, buf: &mut Vec<u8>) {
         let offset = buf.len();
         let blocks_count = block_meta.len();
         if blocks_count > u32::MAX as usize {
@@ -58,16 +55,17 @@ impl BlockMeta {
             buf.put_u32_ne(meta.offset.try_into().unwrap());
         });
 
+        buf.put_u64_ne(max_ts);
         let checksum = crc32fast::hash(&buf[offset..]);
         buf.put_u32_ne(checksum)
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
+    pub fn decode_block_meta(buf: impl Buf) -> Result<(Vec<BlockMeta>, u64)> {
         let mut block_meta = Vec::new();
         {
-            if buf.remaining() < 2 * U32_SIZE {
-                return block_meta;
+            if buf.remaining() < (2 * U32_SIZE) + U64_SIZE {
+                bail!("meta buffer too small");
             }
 
             // last 4 bytes should be the checksum... so, extract it and check it
@@ -76,9 +74,13 @@ impl BlockMeta {
                 .get_u32_ne();
             let computed_checksum = crc32fast::hash(&buf.chunk()[..buf.remaining() - U32_SIZE]);
             if stored_checksum != computed_checksum {
-                return block_meta;
+                bail!("meta checksum mismatched");
             }
         }
+
+        let max_ts = buf.chunk()[buf.remaining() - U64_SIZE..]
+            .as_ref()
+            .get_u64_ne();
 
         let mut buf = buf;
         let blocks_count = buf.get_u32_ne() as usize;
@@ -97,7 +99,7 @@ impl BlockMeta {
             });
         }
 
-        block_meta
+        Ok((block_meta, max_ts))
     }
 }
 
@@ -181,9 +183,9 @@ impl SsTable {
         let block_meta_offset = (&bytes[bytes.len() - U32_SIZE..]).get_u32() as usize;
 
         let block_meta = &bytes[block_meta_offset..bytes.len() - U32_SIZE];
-        let block_meta = BlockMeta::decode_block_meta(block_meta);
+        let (block_meta, max_ts) = BlockMeta::decode_block_meta(block_meta)?;
         if block_meta.is_empty() {
-            return Err(anyhow!("block meta is empty"));
+            bail!("block meta is empty");
         }
 
         let first_key = block_meta
@@ -205,7 +207,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts,
         })
     }
 

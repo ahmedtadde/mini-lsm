@@ -23,6 +23,7 @@ pub struct SsTableBuilder {
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
     key_hashes: Vec<u32>,
+    max_ts: u64,
 }
 
 /// see this https://users.rust-lang.org/t/how-to-find-common-prefix-of-two-byte-slices-effectively/25815/3
@@ -51,6 +52,7 @@ impl SsTableBuilder {
             meta: vec![],
             block_size,
             key_hashes: Default::default(),
+            max_ts: 0,
         }
     }
 
@@ -70,6 +72,7 @@ impl SsTableBuilder {
             let _ = self.builder.add_with_prefix(key, prefix_len, value);
         }
         self.key_hashes.push(farmhash::fingerprint32(key.key_ref()));
+        self.max_ts = self.max_ts.max(key.ts());
     }
 
     fn split_block(&mut self) {
@@ -136,7 +139,7 @@ impl SsTableBuilder {
             .last()
             .map(|meta| meta.last_key.clone())
             .unwrap_or_default();
-        BlockMeta::encode_block_meta(&sst_builder.meta, &mut bytes);
+        BlockMeta::encode_block_meta(&sst_builder.meta, sst_builder.max_ts, &mut bytes);
 
         bytes.put_u32(block_meta_offset as u32);
 
@@ -164,7 +167,7 @@ impl SsTableBuilder {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts: sst_builder.max_ts,
         })
     }
 

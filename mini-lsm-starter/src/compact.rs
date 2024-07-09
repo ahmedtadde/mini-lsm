@@ -390,7 +390,8 @@ impl LsmStorageInner {
                     ),
                 )?;
 
-                self.sync_dir_with_state_lock_observer(&state_lock)?;
+                // self.sync_dir_with_state_lock_observer(&state_lock)?;
+                self.sync_dir()?;
             }
             let mut guard = self.state.write();
             let mut writer = guard.as_ref().clone();
@@ -458,7 +459,8 @@ impl LsmStorageInner {
                     ),
                 )?;
 
-                self.sync_dir_with_state_lock_observer(&state_lock)?;
+                // self.sync_dir_with_state_lock_observer(&state_lock)?;
+                self.sync_dir()?;
             }
 
             let mut writer = self.state.write();
