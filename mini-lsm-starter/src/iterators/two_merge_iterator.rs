@@ -19,7 +19,7 @@ impl<
     > TwoMergeIterator<A, B>
 {
     pub fn create(a: A, b: B) -> Result<Self> {
-        unimplemented!()
+        Ok(Self { a, b })
     }
 }
 
@@ -31,18 +31,63 @@ impl<
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if self.a.is_valid() && !self.b.is_valid() {
+            return self.a.key();
+        }
+
+        if !self.a.is_valid() && self.b.is_valid() {
+            return self.b.key();
+        }
+
+        if self.a.key() <= self.b.key() {
+            self.a.key()
+        } else {
+            self.b.key()
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if self.a.is_valid() && !self.b.is_valid() {
+            return self.a.value();
+        }
+
+        if !self.a.is_valid() && self.b.is_valid() {
+            return self.b.value();
+        }
+
+        if self.a.key() <= self.b.key() {
+            self.a.value()
+        } else {
+            self.b.value()
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.a.is_valid() || self.b.is_valid()
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.a.num_active_iterators() + self.b.num_active_iterators()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        match (self.a.is_valid(), self.b.is_valid()) {
+            (false, false) => Ok(()),
+            (true, false) => self.a.next(),
+            (false, true) => self.b.next(),
+            _ => {
+                if self.a.key() < self.b.key() {
+                    return self.a.next();
+                }
+
+                if self.b.key() < self.a.key() {
+                    return self.b.next();
+                }
+
+                self.a.next()?;
+                self.b.next()?;
+                Ok(())
+            }
+        }
     }
 }
