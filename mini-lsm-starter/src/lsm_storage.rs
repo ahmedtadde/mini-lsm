@@ -355,8 +355,8 @@ impl LsmStorageInner {
                         }
                     }
                     ManifestRecord::Compaction(task, output) => {
-                        let (new_state, old_sst_ids) =
-                            compaction_controller.apply_compaction_result(&state, &task, &output);
+                        let (new_state, old_sst_ids) = compaction_controller
+                            .apply_compaction_result(&state, &task, &output, true);
 
                         // cleanup old sstables
                         for sst_id in &old_sst_ids {

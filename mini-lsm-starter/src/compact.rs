@@ -474,6 +474,7 @@ impl LsmStorageInner {
                 &snapshot,
                 &task,
                 &new_sstables.iter().map(|s| s.sst_id()).collect::<Vec<_>>(),
+                false,
             );
 
             {
