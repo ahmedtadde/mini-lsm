@@ -82,6 +82,11 @@ impl BlockBuilder {
 
         self.last_key = KeyVec::from_vec_with_ts(key.key_ref().to_vec(), key.ts());
 
+        // println!(
+        //     "iambatman/block_builder::add_with_prefix: exiting with estimated size: {}",
+        //     self.data.len()
+        // );
+
         true
     }
 
@@ -94,6 +99,10 @@ impl BlockBuilder {
     /// Check if there is no key-value pair in the block.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    pub fn estimated_size(&self) -> usize {
+        self.data.len()
     }
 
     pub fn last_key(&self) -> KeyVec {

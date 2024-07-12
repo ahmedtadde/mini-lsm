@@ -69,6 +69,7 @@ impl SsTableBuilder {
         let ok = self.builder.add_with_prefix(key, prefix_len, value);
         if !ok {
             self.split_block();
+            // println!("iambatman/sst_builder::add: split block successful");
             let _ = self.builder.add_with_prefix(key, prefix_len, value);
         }
         self.key_hashes.push(farmhash::fingerprint32(key.key_ref()));
@@ -104,7 +105,7 @@ impl SsTableBuilder {
     /// Since the data blocks contain much more data than meta blocks, just return the size of data
     /// blocks here.
     pub fn estimated_size(&self) -> usize {
-        self.data.len()
+        self.data.len() + self.builder.estimated_size()
     }
 
     pub fn is_empty(&self) -> bool {

@@ -20,7 +20,7 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::KeySlice;
+use crate::key::{KeySlice, KeyVec};
 use crate::lsm_iterator::FusedIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
@@ -131,7 +131,12 @@ impl LsmStorageInner {
     fn ssts_from_compact_iter(
         &self,
         mut sstable_iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
+        is_lower_level_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
+        // println!(
+        //     "iambatman/ssts_from_compact_iter: invoked with is_lower_level_bottom_level {}",
+        //     is_lower_level_bottom_level
+        // );
         assert!(
             self.options.target_sst_size > 0,
             "target_sst_size must be greater than 0"
@@ -147,22 +152,80 @@ impl LsmStorageInner {
         // println!("iambatman/ssts_from_compact_iter: invoked");
         let mut new_sstables = Vec::new();
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+        let watermark = self.mvcc().watermark();
+        let mut last_deleted_key = KeyVec::new();
+        // println!("iambatman/ssts_from_compact_iter: watermark {}", watermark);
 
         while sstable_iter.is_valid() {
+            let last_inserted_key = sst_builder.last_inserted_key();
             let key = sstable_iter.key();
+            let value = sstable_iter.value();
+
+            {
+                let key_ts = key.ts();
+                if key_ts <= watermark // key version is older than the watermark
+                    && (
+                        key.key_ref() == last_deleted_key.key_ref() // key is the same as the last deleted key
+                        || (
+                            value.is_empty() && is_lower_level_bottom_level // value is empty and we are compacting to the bottom level
+                        )
+                        || (
+                            key.key_ref() == last_inserted_key.key_ref() // key is the same as the last inserted key
+                            && last_inserted_key.ts() <= watermark // last inserted key is older than the watermark
+                        )
+                    )
+                {
+                    // println!(
+                    //     "iambatman/ssts_from_compact_iter: key_ref {:?}, key_ts {} <= watermark {}, value is empty?{}, last inserted key ref {:?}, last inserted key ts {} ... so garbage collecting",
+                    //     key.key_ref(),
+                    //     key_ts, watermark,
+                    //     value.is_empty(),
+                    //     last_inserted_key.key_ref(),
+                    //     last_inserted_key.ts()
+                    // );
+
+                    if value.is_empty() {
+                        last_deleted_key = KeyVec::from_vec_with_ts(key.key_ref().to_vec(), key_ts);
+                    }
+
+                    sstable_iter.next()?;
+                    continue;
+                }
+
+                // if key_ts <= watermark {
+                //     println!(
+                //         "iambatman/ssts_from_compact_iter: key_ref {:?}, key_ts {} <= watermark {}, value is empty?{}, last inserted key ref {:?}, last inserted key ts {} ... BUT NOT garbage collecting",
+                //         key.key_ref(),
+                //         key_ts, watermark,
+                //         value.is_empty(),
+                //         last_inserted_key.key_ref(),
+                //         last_inserted_key.ts()
+                //     );
+                // }
+
+                // let txn_readers = self.mvcc().txn_readers();
+
+                // if is_lower_level_bottom_level && txn_readers.binary_search(&key_ts).is_err() {
+                //     println!(
+                //         "iambatman/ssts_from_compact_iter: key_ts {} not found in txn_readers {:?}... so garbage collecting key {:?}",
+                //         key_ts, txn_readers, key.key_ref()
+                //     );
+
+                //     sstable_iter.next()?;
+                //     continue;
+                // }
+            }
+
+            // println!(
+            //     "iambatman/ssts_from_compact_iter: last inserted key: {:?}, {:?}",
+            //     last_inserted_key.key_ref(),
+            //     last_inserted_key.ts(),
+            // );
+
             // println!(
             //     "iambatman/ssts_from_compact_iter: iter key: {:?}, {:?}",
             //     key.key_ref(),
             //     key.ts()
-            // );
-
-            let value = sstable_iter.value();
-
-            let last_inserted_key = sst_builder.last_inserted_key();
-            // println!(
-            //     "iambatman/ssts_from_compact_iter: last inserted key: {:?}, {:?}",
-            //     last_inserted_key.key_ref(),
-            //     last_inserted_key.ts()
             // );
 
             // println!(
@@ -189,7 +252,19 @@ impl LsmStorageInner {
                 new_sstables.push(Arc::new(sstable));
             }
 
+            // println!(
+            //     "iambatman/ssts_from_compact_iter: adding key {:?}, {:?} to sst_builder(size={})",
+            //     key.key_ref(),
+            //     key.ts(),
+            //     sst_builder.estimated_size()
+            // );
             sst_builder.add(key, value);
+            // println!(
+            //     "iambatman/ssts_from_compact_iter: updated sst_builder(size={}) after adding key {:?}, {:?}",
+            //     sst_builder.estimated_size(),
+            //     key.key_ref(),
+            //     key.ts()
+            // );
             sstable_iter.next()?;
         }
 
@@ -231,7 +306,7 @@ impl LsmStorageInner {
             )
         };
 
-        self.ssts_from_compact_iter(FusedIterator::new(sstables))
+        self.ssts_from_compact_iter(FusedIterator::new(sstables), task.bottom_tier_included)
     }
 
     fn simple_leveled_compaction(
@@ -271,7 +346,10 @@ impl LsmStorageInner {
             TwoMergeIterator::create(upper_level_iter, lower_level_iter)?
         };
 
-        self.ssts_from_compact_iter(FusedIterator::new(sstables))
+        self.ssts_from_compact_iter(
+            FusedIterator::new(sstables),
+            task.is_lower_level_bottom_level,
+        )
     }
 
     fn leveled_compaction(&self, task: &LeveledCompactionTask) -> Result<Vec<Arc<SsTable>>> {
@@ -296,10 +374,13 @@ impl LsmStorageInner {
 
                 drop(reader);
 
-                self.ssts_from_compact_iter(FusedIterator::new(TwoMergeIterator::create(
-                    upper_level_iter,
-                    lower_level_iter,
-                )?))
+                self.ssts_from_compact_iter(
+                    FusedIterator::new(TwoMergeIterator::create(
+                        upper_level_iter,
+                        lower_level_iter,
+                    )?),
+                    task.is_lower_level_bottom_level,
+                )
             }
             None => {
                 let reader = self.state.read();
@@ -322,10 +403,13 @@ impl LsmStorageInner {
 
                 drop(reader);
 
-                self.ssts_from_compact_iter(FusedIterator::new(TwoMergeIterator::create(
-                    upper_level_iter,
-                    lower_level_iter,
-                )?))
+                self.ssts_from_compact_iter(
+                    FusedIterator::new(TwoMergeIterator::create(
+                        upper_level_iter,
+                        lower_level_iter,
+                    )?),
+                    task.is_lower_level_bottom_level,
+                )
             }
         }
     }
@@ -334,7 +418,7 @@ impl LsmStorageInner {
         &self,
         l0_sstables: &[usize],
         l1_sstables: &[usize],
-        _is_lower_level_bottom_level: bool,
+        is_lower_level_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
         let sstables = {
             let reader = {
@@ -360,7 +444,7 @@ impl LsmStorageInner {
             TwoMergeIterator::create(MergeIterator::create(l0_sstables_iter), l1_sstables_iter)
         }?;
 
-        self.ssts_from_compact_iter(FusedIterator::new(sstables))
+        self.ssts_from_compact_iter(FusedIterator::new(sstables), is_lower_level_bottom_level)
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {

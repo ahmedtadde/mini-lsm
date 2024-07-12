@@ -25,6 +25,14 @@ impl Watermark {
         }
     }
 
+    pub fn num_retained_snapshots(&self) -> usize {
+        self.readers.keys().count()
+    }
+
+    pub fn readers(&self) -> Vec<u64> {
+        self.readers.keys().copied().collect()
+    }
+
     pub fn watermark(&self) -> Option<u64> {
         self.readers.keys().next().copied()
     }

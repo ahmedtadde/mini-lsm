@@ -2,7 +2,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 pub mod txn;
-mod watermark;
+pub(crate) mod watermark;
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -54,9 +54,14 @@ impl LsmMvccInner {
         ts.1.watermark().unwrap_or(ts.0)
     }
 
+    pub fn txn_readers(&self) -> Vec<u64> {
+        self.ts.lock().1.readers()
+    }
+
     pub fn new_txn(&self, inner: Arc<LsmStorageInner>, serializable: bool) -> Arc<Transaction> {
-        let reader = self.ts.lock();
-        let read_ts = reader.0;
+        let mut writer = self.ts.lock();
+        let read_ts = writer.0;
+        writer.1.add_reader(read_ts);
         Arc::new(Transaction {
             read_ts,
             inner,
