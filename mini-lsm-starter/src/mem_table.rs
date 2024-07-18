@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
@@ -112,26 +112,39 @@ impl MemTable {
     /// In week 2, day 6, also flush the data to WAL.
     /// In week 3, day 5, modify the function to use the batch API.
     pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
-        let insert_key =
-            KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(key.key_ref()), key.ts());
-        let insert_value = Bytes::copy_from_slice(value);
-        self.map.insert(insert_key, insert_value);
-
-        if let Some(ref wal) = self.wal {
-            wal.put(&key, value)?;
-            // wal.sync()?;
-        }
-
-        self.approximate_size.fetch_add(
-            key.raw_len() + value.len(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        Ok(())
+        self.put_batch(&[(key, value)])
     }
 
     /// Implement this in week 3, day 5.
-    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
-        unimplemented!()
+    pub fn put_batch(&self, entries: &[(KeySlice, &[u8])]) -> Result<()> {
+        let batch_size = entries
+            .iter()
+            .fold(0, |acc, (key, value)| acc + key.raw_len() + value.len());
+
+        if batch_size == 0 {
+            return Ok(());
+        }
+
+        for (key, value) in entries {
+            let insert_key =
+                KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(key.key_ref()), key.ts());
+            let insert_value = Bytes::copy_from_slice(value);
+            self.map.insert(insert_key, insert_value);
+        }
+
+        if let Some(ref wal) = self.wal {
+            wal.put_batch(
+                &entries
+                    .iter()
+                    .map(|(key, value)| (key, *value))
+                    .collect::<Vec<_>>(),
+            )?;
+        }
+
+        self.approximate_size
+            .fetch_add(batch_size, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(())
     }
 
     pub fn sync_wal(&self) -> Result<()> {

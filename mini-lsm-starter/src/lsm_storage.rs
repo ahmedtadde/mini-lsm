@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Ok, Result};
 use bytes::Bytes;
+use itertools::Itertools;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::block::Block;
@@ -561,9 +562,32 @@ impl LsmStorageInner {
         txn.get(key)
     }
 
+    pub fn write_batch<T: AsRef<[u8]>>(
+        self: &Arc<Self>,
+        batch: &[WriteBatchRecord<T>],
+    ) -> Result<()> {
+        if self.options.serializable {
+            let txn = self.mvcc().new_txn(self.clone(), true);
+            for record in batch {
+                match record {
+                    WriteBatchRecord::Put(key, value) => txn.put(key.as_ref(), value.as_ref()),
+                    WriteBatchRecord::Del(key) => txn.delete(key.as_ref()),
+                }
+            }
+            return txn.commit();
+        }
+
+        self.write_batch_inner(batch)
+            .map(|_| ())
+            .map_err(|e| anyhow!("failed to write batch: {:?}", e))
+    }
+
     /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        let memtable_capacity = {
+    pub(crate) fn write_batch_inner<T: AsRef<[u8]>>(
+        &self,
+        batch: &[WriteBatchRecord<T>],
+    ) -> Result<u64> {
+        let (write_ts, memtable_capacity) = {
             let guard = self.state.read();
             let writer = guard.as_ref().memtable.clone();
             let mvcc_handle = self.mvcc.as_ref();
@@ -602,26 +626,29 @@ impl LsmStorageInner {
                 }
             }
 
-            for record in batch {
-                match record {
-                    WriteBatchRecord::Put(key, value) => {
-                        // println!(
-                        //     "iambatman/write_batch:memtable_capacity:putting key: ({:?}, {:?})",
-                        //     key.as_ref(),
-                        //     ts
-                        // );
-                        writer.put(KeySlice::from_slice(key.as_ref(), ts), value.as_ref())?;
-                    }
-                    WriteBatchRecord::Del(key) => {
-                        // println!(
-                        //     "iambatman/write_batch:memtable_capacity:deleting key: ({:?}, {:?})",
-                        //     key.as_ref(),
-                        //     ts
-                        // );
-                        writer.put(KeySlice::from_slice(key.as_ref(), ts), &[])?;
-                    }
-                }
-            }
+            writer.put_batch(
+                &batch
+                    .iter()
+                    .map(|record| match record {
+                        WriteBatchRecord::Put(key, value) => {
+                            // println!(
+                            //     "iambatman/write_batch:memtable_capacity:putting key: ({:?}, {:?})",
+                            //     key.as_ref(),
+                            //     ts
+                            // );
+                            (KeySlice::from_slice(key.as_ref(), ts), value.as_ref())
+                        }
+                        WriteBatchRecord::Del(key) => {
+                            // println!(
+                            //     "iambatman/write_batch:memtable_capacity:deleting key: ({:?}, {:?})",
+                            //     key.as_ref(),
+                            //     ts
+                            // );
+                            (KeySlice::from_slice(key.as_ref(), ts), [].as_ref())
+                        }
+                    })
+                    .collect_vec(),
+            )?;
 
             if let Some(handle) = mvcc_handle {
                 if mvcc_handle_lock.is_some() {
@@ -633,7 +660,7 @@ impl LsmStorageInner {
                 }
             }
 
-            writer.approximate_size()
+            (ts, writer.approximate_size())
         };
 
         if memtable_capacity >= self.options.target_sst_size {
@@ -643,17 +670,27 @@ impl LsmStorageInner {
             }
         }
 
-        Ok(())
+        Ok(write_ts)
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(self: &Arc<Self>, key: &[u8], value: &[u8]) -> Result<()> {
+        if self.options.serializable {
+            let txn = self.mvcc().new_txn(self.clone(), true);
+            txn.put(key, value);
+            return txn.commit();
+        }
         self.write_batch(&[WriteBatchRecord::Put(key, value)])?;
         Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(self: &Arc<Self>, key: &[u8]) -> Result<()> {
+        if self.options.serializable {
+            let txn = self.mvcc().new_txn(self.clone(), true);
+            txn.delete(key);
+            return txn.commit();
+        }
         self.write_batch(&[WriteBatchRecord::Del(key)])?;
         Ok(())
     }
