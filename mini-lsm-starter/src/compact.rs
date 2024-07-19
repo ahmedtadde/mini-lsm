@@ -22,7 +22,7 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::{KeySlice, KeyVec};
 use crate::lsm_iterator::FusedIterator;
-use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::lsm_storage::{CompactionFilter, LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -153,6 +153,7 @@ impl LsmStorageInner {
         let mut new_sstables = Vec::new();
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
         let watermark = self.mvcc().watermark();
+        let compaction_filters = self.compaction_filters.lock();
         let mut last_deleted_key = KeyVec::new();
         // println!("iambatman/ssts_from_compact_iter: watermark {}", watermark);
 
@@ -190,30 +191,35 @@ impl LsmStorageInner {
 
                     sstable_iter.next()?;
                     continue;
+                } else if key_ts <= watermark && compaction_filters.len() > 0 {
+                    let mut compaction_filter_predicate = false;
+                    for filter in &*compaction_filters {
+                        let CompactionFilter::Prefix(prefix) = filter;
+                        compaction_filter_predicate = key.key_ref().starts_with(prefix.as_ref());
+                        if compaction_filter_predicate {
+                            break;
+                        }
+                    }
+
+                    if compaction_filter_predicate {
+                        // println!(
+                        //     "iambatman/ssts_from_compact_iter: key_ref {:?}, key_ts {} <= watermark {}, value is empty?{}, compaction_filter_predicate {} ... so garbage collecting",
+                        //     key.key_ref(),
+                        //     key_ts,
+                        //     watermark,
+                        //     value.is_empty(),
+                        //     compaction_filter_predicate,
+                        // );
+
+                        if value.is_empty() {
+                            last_deleted_key =
+                                KeyVec::from_vec_with_ts(key.key_ref().to_vec(), key_ts);
+                        }
+
+                        sstable_iter.next()?;
+                        continue;
+                    }
                 }
-
-                // if key_ts <= watermark {
-                //     println!(
-                //         "iambatman/ssts_from_compact_iter: key_ref {:?}, key_ts {} <= watermark {}, value is empty?{}, last inserted key ref {:?}, last inserted key ts {} ... BUT NOT garbage collecting",
-                //         key.key_ref(),
-                //         key_ts, watermark,
-                //         value.is_empty(),
-                //         last_inserted_key.key_ref(),
-                //         last_inserted_key.ts()
-                //     );
-                // }
-
-                // let txn_readers = self.mvcc().txn_readers();
-
-                // if is_lower_level_bottom_level && txn_readers.binary_search(&key_ts).is_err() {
-                //     println!(
-                //         "iambatman/ssts_from_compact_iter: key_ts {} not found in txn_readers {:?}... so garbage collecting key {:?}",
-                //         key_ts, txn_readers, key.key_ref()
-                //     );
-
-                //     sstable_iter.next()?;
-                //     continue;
-                // }
             }
 
             // println!(
